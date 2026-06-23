@@ -1,0 +1,42 @@
+# mcp-email-rs TOML Configuration
+# Copy to email.toml, ~/.config/mcp-email-rs/email.toml, or set EMAIL_CONFIG path
+
+[imap]
+host = "imap.gmail.com"
+port = 993
+user = "you@example.com"
+password = "your-app-password"
+tls = true
+tls_reject_unauthorized = true
+auth = "plain"
+# xoauth2_token = ""  # Only needed when auth = "xoauth2"
+
+[smtp]
+# host = "smtp.gmail.com"    # Defaults to imap.host
+# port = 465
+# user = "you@example.com"   # Defaults to imap.user
+# password = "your-password"  # Defaults to imap.password
+# starttls = false
+
+# Default From address used when send_email is called without an explicit
+# `from`. Falls back to imap.user when unset. Configure this when sending
+# from an alias your provider has authorized for "Send mail as".
+# from_address = "alias@example.com"
+
+# When to APPEND outgoing mail to the IMAP Sent folder:
+#   "auto"   — Gmail/Outlook/Office365 → Never (server auto-saves);
+#              other providers → Always (client APPENDs explicitly).
+#   "true"/"always" — force APPEND.
+#   "false"/"never" — never APPEND (assume server saves).
+# Override via env: EMAIL_SAVE_SENT=true|false|auto
+# save_sent = "auto"
+
+# Addresses allowed as `from` override on send_email. Defaults to
+# [from_address] (or [imap.user] when from_address is unset) so the tool
+# cannot spoof unrelated identities by accident.
+# allowed_from = ["alias@example.com", "team@example.com"]
+
+[pool]
+# max_connections = 4
+# idle_timeout_secs = 300
+# operation_timeout_secs = 30

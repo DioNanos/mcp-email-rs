@@ -1,0 +1,9 @@
+From: Test Sender <sender@example.com>
+To: Recipient <recipient@example.com>
+Subject: Simple plain text email
+Date: Tue, 08 Apr 2025 14:30:00 +0200
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+This is a simple plain text email with no attachments.
+Multiple lines of text here.

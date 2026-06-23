@@ -1,0 +1,6 @@
+/target
+*.swp
+.env
+.env.local
+email.toml
+tokens/

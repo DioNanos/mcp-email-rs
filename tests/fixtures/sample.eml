@@ -1,0 +1,31 @@
+From: Alice Smith <alice@example.com>
+To: Bob Jones <bob@example.com>
+Cc: Charlie <charlie@example.com>
+Subject: Test Email with Attachment =?utf-8?Q?=C3=A8_una_prova?=
+Date: Mon, 07 Apr 2025 10:00:00 +0200
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="boundary123"
+
+--boundary123
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: quoted-printable
+
+This is a test email body.
+Second line with =C3=A8 special chars.
+
+--boundary123
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: quoted-printable
+
+<html><body><h1>Test HTML</h1><p>This is =C3=A8 HTML.</p></body></html>
+
+--boundary123
+Content-Type: application/pdf; name="report.pdf"
+Content-Disposition: attachment; filename="report.pdf"
+Content-Transfer-Encoding: base64
+
+JVBERi0xLjQKMSAwIG9iago8PAovVHlwZSAvQ2F0YWxvZwovUGFnZXMgMiAwIAo+PgplbmRv
+YmoKMiAwIG9iago8PAovVHlwZSAvUGFnZXMKL0tpZHMgWzMgMCBSXQovQ291bnQgMQo+Pgpl
+bmRvYmoKMyAwIG9iago8PAovVHlwZSAvUGFnZQovUGFyZW50IDIgMCBSCi9NZWRpYUJveCBb
+
+--boundary123--
