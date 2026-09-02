@@ -2,6 +2,11 @@ use std::path::Path;
 
 use crate::error::EmailError;
 
+/// Lower bound for the configured timeout of one IMAP operation.
+pub const MIN_OPERATION_TIMEOUT_SECS: u64 = 1;
+/// Upper bound for the configured timeout of one IMAP operation.
+pub const MAX_OPERATION_TIMEOUT_SECS: u64 = 300;
+
 /// IMAP authentication mechanism
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AuthMechanism {
@@ -154,7 +159,9 @@ pub struct EmailConfig {
     pub pool_max_connections: usize,
     pub pool_idle_timeout_secs: u64,
 
-    // Operation timeout (seconds)
+    /// Timeout for one IMAP operation, in seconds. Values from
+    /// `EMAIL_OPERATION_TIMEOUT` or `[pool].operation_timeout_secs` are
+    /// clamped to [`MIN_OPERATION_TIMEOUT_SECS`..=`MAX_OPERATION_TIMEOUT_SECS`].
     pub operation_timeout_secs: u64,
 }
 
@@ -340,6 +347,9 @@ impl EmailConfig {
             })
             .unwrap_or(300);
 
+        // A zero timeout makes every operation fail immediately, while an
+        // unbounded value can pin a pool forever. Keep the user setting
+        // configurable but fail-safe at both edges.
         let operation_timeout_secs = tp
             .operation_timeout_secs
             .or_else(|| {
@@ -347,7 +357,8 @@ impl EmailConfig {
                     .ok()
                     .and_then(|v| v.parse().ok())
             })
-            .unwrap_or(30);
+            .unwrap_or(30)
+            .clamp(MIN_OPERATION_TIMEOUT_SECS, MAX_OPERATION_TIMEOUT_SECS);
 
         Ok(Self {
             imap_host,
@@ -388,6 +399,7 @@ impl EmailConfig {
             "SMTP_PASSWORD",
             "SMTP_FROM_ADDRESS",
             "EMAIL_SAVE_SENT",
+            "EMAIL_OPERATION_TIMEOUT",
         ]
         .iter()
         .map(|k| (*k, std::env::var(k).ok()))
@@ -556,6 +568,35 @@ mod tests {
         "#;
         let cfg = EmailConfig::from_toml_str(toml).expect("config builds");
         assert_eq!(cfg.smtp_save_sent, SaveSentMode::Never);
+    }
+
+    #[test]
+    fn operation_timeout_is_clamped_to_safe_range() {
+        let low = EmailConfig::from_toml_str(
+            r#"
+                [imap]
+                host = "imap.example.com"
+                user = "user@example.com"
+                password = "pw"
+                [pool]
+                operation_timeout_secs = 0
+            "#,
+        )
+        .expect("low timeout config builds");
+        assert_eq!(low.operation_timeout_secs, MIN_OPERATION_TIMEOUT_SECS);
+
+        let high = EmailConfig::from_toml_str(
+            r#"
+                [imap]
+                host = "imap.example.com"
+                user = "user@example.com"
+                password = "pw"
+                [pool]
+                operation_timeout_secs = 10000
+            "#,
+        )
+        .expect("high timeout config builds");
+        assert_eq!(high.operation_timeout_secs, MAX_OPERATION_TIMEOUT_SECS);
     }
 
     #[test]

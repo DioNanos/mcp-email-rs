@@ -116,6 +116,9 @@ IMAP_AUTH=plain            # plain | login | xoauth2 | cram-md5
 # SMTP is optional — defaults to the IMAP host/credentials
 # SMTP_HOST=smtp.example.com
 # SMTP_PORT=587
+
+# Per-operation IMAP timeout in seconds (clamped to 1..=300)
+# EMAIL_OPERATION_TIMEOUT=30
 ```
 
 For Gmail/Workspace use an app password (or XOAUTH2). A `email.toml` file is

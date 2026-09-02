@@ -16,6 +16,7 @@ use crate::folder::{self, FolderInfo};
 use crate::message::{self, EmailSummary};
 use crate::provider::EmailProvider;
 use crate::provider::imap_provider::ImapProvider;
+use crate::search_boundary;
 use std::path::{Component, Path, PathBuf};
 
 // ── Security helpers (sanitization for IMAP + filesystem sinks) ──────
@@ -27,24 +28,91 @@ fn escape_imap_literal(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-/// Validate an IMAP date used UNQUOTED in SEARCH (BEFORE/SINCE/ON): `dd-Mon-yyyy`.
-fn validate_imap_date(s: &str) -> Result<&str, McpError> {
-    let parts: Vec<&str> = s.split('-').collect();
-    let ok = parts.len() == 3
+/// Month abbreviations IMAP SEARCH expects in `dd-Mon-yyyy` (RFC 3501 §9).
+const IMAP_MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// Days per month (non-leap; February 29 accepted only on leap years).
+fn days_in_month(year: u32, month: u32) -> Option<u32> {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => Some(31),
+        4 | 6 | 9 | 11 => Some(30),
+        2 => {
+            let leap =
+                (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
+            Some(if leap { 29 } else { 28 })
+        }
+        _ => None,
+    }
+}
+
+/// True when a fetched-flag string marks the message as seen. The IMAP
+/// layer surfaces flags through `Debug`, so we match the flag name and the
+/// RFC name; the unit tests pin both renderings.
+pub(crate) fn flag_is_seen(flag: &str) -> bool {
+    flag == "Seen" || flag == "\\Seen"
+}
+
+/// Normalize a user-supplied date to the IMAP SEARCH form `dd-Mon-yyyy`.
+///
+/// Accepts ISO `YYYY-MM-DD` (the format every caller reasonably tries first,
+/// see the 2026-08-31 Personal handoff) and the native IMAP form
+/// (`dd-Mon-yyyy`, month name case-insensitive, normalized to title case).
+/// The error always names both accepted formats: a date mistake must reach
+/// the caller as an MCP error, never collapse into "zero emails".
+pub(crate) fn normalize_imap_date(s: &str) -> Result<String, McpError> {
+    let trimmed = s.trim();
+    let parts: Vec<&str> = trimmed.split('-').collect();
+    if parts.len() == 3
+        && parts[0].len() == 4
+        && parts[1].len() == 2
+        && parts[2].len() == 2
+        && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit()))
+    {
+        let year: u32 = parts[0].parse().map_err(|_| date_error(trimmed))?;
+        let month: u32 = parts[1].parse().map_err(|_| date_error(trimmed))?;
+        let day: u32 = parts[2].parse().map_err(|_| date_error(trimmed))?;
+        return imap_date_from(year, month, day, trimmed);
+    }
+    if parts.len() == 3
         && (1..=2).contains(&parts[0].len())
         && parts[0].chars().all(|c| c.is_ascii_digit())
         && parts[1].len() == 3
         && parts[1].chars().all(|c| c.is_ascii_alphabetic())
         && parts[2].len() == 4
-        && parts[2].chars().all(|c| c.is_ascii_digit());
-    if ok {
-        Ok(s)
-    } else {
-        Err(McpError::internal_error(
-            format!("Invalid IMAP date (expected dd-Mon-yyyy): {s}"),
-            None,
-        ))
+        && parts[2].chars().all(|c| c.is_ascii_digit())
+    {
+        let day: u32 = parts[0].parse().map_err(|_| date_error(trimmed))?;
+        let month_name = parts[1];
+        let month = 1 + IMAP_MONTHS
+            .iter()
+            .position(|m| m.eq_ignore_ascii_case(month_name))
+            .ok_or_else(|| date_error(trimmed))? as u32;
+        let year: u32 = parts[2].parse().map_err(|_| date_error(trimmed))?;
+        return imap_date_from(year, month, day, trimmed);
     }
+    Err(date_error(trimmed))
+}
+
+fn imap_date_from(year: u32, month: u32, day: u32, original: &str) -> Result<String, McpError> {
+    let max_day = days_in_month(year, month).ok_or_else(|| date_error(original))?;
+    if day == 0 || day > max_day {
+        return Err(date_error(original));
+    }
+    Ok(format!(
+        "{day:02}-{}-{year}",
+        IMAP_MONTHS[(month - 1) as usize]
+    ))
+}
+
+fn date_error(original: &str) -> McpError {
+    McpError::invalid_params(
+        format!(
+            "Invalid date '{original}': expected ISO 'YYYY-MM-DD' (e.g. 2026-08-30) or IMAP 'dd-Mon-yyyy' (e.g. 30-Aug-2026)"
+        ),
+        None,
+    )
 }
 
 /// Validate an IMAP sequence-set (UID range): digits, `,`, `:`, `*` only.
@@ -74,6 +142,63 @@ fn validate_header_name(s: &str) -> Result<&str, McpError> {
             None,
         ))
     }
+}
+
+/// Compose ONE Gmail search-language term for the X-GM-RAW extension.
+///
+/// The Gmail search language treats a QUOTED value as an exact-phrase
+/// match, so `from:"alpine"` returns ZERO hits against a message from
+/// alpine-lodge@example.com while the bare token `from:alpine` matches.
+/// Quoting every value — the old behavior — silently broke every string
+/// search routed through X-GM-RAW.
+///
+/// The quotes are not decoration, though: a value with spaces or syntax
+/// characters still needs the quoted form to be searchable, and an
+/// unquoted value must never smuggle extra search keys into the query.
+/// So:
+/// - a bare token (alphanumerics plus the address-safe set `._%+-@`, the
+///   shape of usernames and domains) is emitted UNQUOTED: word match;
+/// - anything else is emitted as a quoted phrase: exact-phrase match;
+/// - a value that contains a double quote cannot be expressed reliably
+///   inside a Gmail quoted phrase, and an empty value matches nothing
+///   meaningful: both are REFUSED with an explicit error — a visible
+///   failure, never an ambiguous query nor a silent empty result;
+/// - backslashes are left RAW here: the Gmail language reads them as
+///   literals, and the IMAP-level escaping of the whole X-GM-RAW argument
+///   happens once at the composition site (`escape_imap_literal(&raw)`).
+fn gmail_search_term(key: Option<&str>, value: &str) -> Result<String, McpError> {
+    let bare_token = !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '%' | '+' | '-' | '@'));
+    if bare_token {
+        return Ok(match key {
+            Some(k) => format!("{k}:{value}"),
+            None => value.to_string(),
+        });
+    }
+    if value.trim().is_empty() {
+        return Err(McpError::internal_error(
+            format!(
+                "Gmail search: empty value for {} matches nothing — refusing",
+                key.unwrap_or("term")
+            ),
+            None,
+        ));
+    }
+    if value.contains('"') {
+        return Err(McpError::internal_error(
+            format!(
+                "Gmail search: double quotes inside the {} value are not expressible in a quoted phrase — refusing",
+                key.unwrap_or("term")
+            ),
+            None,
+        ));
+    }
+    Ok(match key {
+        Some(k) => format!("{k}:\"{value}\""),
+        None => format!("\"{value}\""),
+    })
 }
 
 /// Confine an attachment `save_path` to `base`: reject absolute paths and `..`
@@ -132,8 +257,25 @@ impl_schema!(ListEmailsParams, "ListEmailsParams", {
     "properties": {
         "folder": { "type": "string" },
         "limit": { "type": "integer", "minimum": 1 },
-        "unseen_only": { "type": "boolean" },
-        "since_date": { "type": "string" }
+        "unseen_only": { "type": "boolean", "description": "Only messages without the \\Seen flag (server-searched and re-filtered on fetched flags)" },
+        "since_date": { "type": "string", "description": "Date filter, ISO 'YYYY-MM-DD' (e.g. 2026-08-30) or IMAP 'dd-Mon-yyyy' (e.g. 30-Aug-2026)" }
+    },
+    "additionalProperties": false
+});
+
+#[derive(Debug, Deserialize)]
+pub struct ListRecentUnseenParams {
+    pub folder: Option<String>,
+    pub limit: Option<u32>,
+    pub since_date: Option<String>,
+}
+
+impl_schema!(ListRecentUnseenParams, "ListRecentUnseenParams", {
+    "type": "object",
+    "properties": {
+        "folder": { "type": "string", "description": "Folder to scan (default INBOX); use the name returned by list_folders" },
+        "limit": { "type": "integer", "minimum": 1 },
+        "since_date": { "type": "string", "description": "Date filter, ISO 'YYYY-MM-DD' (e.g. 2026-08-30) or IMAP 'dd-Mon-yyyy' (e.g. 30-Aug-2026)" }
     },
     "additionalProperties": false
 });
@@ -178,8 +320,8 @@ impl_schema!(SearchEmailsParams, "SearchEmailsParams", {
         "body": { "type": "string" },
         "to": { "type": "string" },
         "cc": { "type": "string" },
-        "before": { "type": "string" },
-        "since": { "type": "string" },
+        "before": { "type": "string", "description": "Date filter, ISO 'YYYY-MM-DD' (e.g. 2026-08-30) or IMAP 'dd-Mon-yyyy'" },
+        "since": { "type": "string", "description": "Date filter, ISO 'YYYY-MM-DD' (e.g. 2026-08-30) or IMAP 'dd-Mon-yyyy'" },
         "header": { "type": "string" },
         "uid_range": { "type": "string" },
         "limit": { "type": "integer", "minimum": 1 }
@@ -481,6 +623,7 @@ pub struct ListEmailsWithHeadersParams {
     pub headers: Vec<String>,
     pub limit: Option<u32>,
     pub unseen_only: Option<bool>,
+    pub since_date: Option<String>,
 }
 
 impl_schema!(ListEmailsWithHeadersParams, "ListEmailsWithHeadersParams", {
@@ -492,7 +635,8 @@ impl_schema!(ListEmailsWithHeadersParams, "ListEmailsWithHeadersParams", {
             "items": { "type": "string" }
         },
         "limit": { "type": "integer", "minimum": 1 },
-        "unseen_only": { "type": "boolean" }
+        "unseen_only": { "type": "boolean", "description": "Only messages without the \\Seen flag (server-searched and re-filtered on fetched flags)" },
+        "since_date": { "type": "string", "description": "Date filter, ISO 'YYYY-MM-DD' (e.g. 2026-08-30) or IMAP 'dd-Mon-yyyy' (e.g. 30-Aug-2026)" }
     },
     "required": ["headers"],
     "additionalProperties": false
@@ -769,16 +913,15 @@ impl EmailServer {
             search_criteria.push_str("UNSEEN ");
         }
         if let Some(ref date) = params.since_date {
-            search_criteria.push_str(&format!("SINCE {} ", validate_imap_date(date)?));
+            search_criteria.push_str(&format!("SINCE {} ", normalize_imap_date(date)?));
         }
         if search_criteria.is_empty() {
             search_criteria = "ALL".to_string();
         }
 
-        let uids: std::collections::HashSet<u32> = conn
-            .uid_search(&search_criteria)
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let uids: std::collections::HashSet<u32> =
+            search_boundary::uid_search(&mut conn, &search_criteria, self.imap_operation_timeout())
+                .await?;
 
         let mut uid_list: Vec<u32> = uids.into_iter().collect();
         uid_list.sort_by(|a, b| b.cmp(a)); // newest first
@@ -806,13 +949,83 @@ impl EmailServer {
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-        let emails: Vec<EmailSummary> = fetches_vec
+        let mut emails: Vec<EmailSummary> = fetches_vec
             .into_iter()
             .filter_map(|f| f.uid.map(|uid| message::extract_summary(uid, &f)))
             .collect();
+        if params.unseen_only.unwrap_or(false) {
+            // Belt-and-braces: a SEARCH UNSEEN that lies must not surface
+            // already-seen rows (2026-08-31 Personal handoff, finding #1).
+            emails.retain(|e| !e.flags.iter().any(|f| flag_is_seen(f)));
+        }
 
         Ok(CallToolResult::success(vec![
             Content::json(&emails).map_err(|e| McpError::internal_error(e.to_string(), None))?,
+        ]))
+    }
+
+    #[tool(
+        description = "Read-only tick primitive: the newest unseen messages of a folder in one stable shape (items + uids + count). Accepts since_date in ISO YYYY-MM-DD or IMAP dd-Mon-yyyy. Errors surface as MCP errors, never as an empty list.",
+        annotations(read_only_hint = true)
+    )]
+    async fn list_recent_unseen(
+        &self,
+        params: Parameters<ListRecentUnseenParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let params = params.0;
+        let folder = params.folder.as_deref().unwrap_or("INBOX");
+        let limit = params.limit.unwrap_or(20);
+
+        let resolved_folder = self.resolve_folder(folder).await?;
+        let mut conn = self.get_imap_connection().await?;
+        conn.select(&resolved_folder)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let mut search_criteria = String::from("UNSEEN ");
+        if let Some(ref date) = params.since_date {
+            search_criteria.push_str(&format!("SINCE {} ", normalize_imap_date(date)?));
+        }
+
+        let uids: std::collections::HashSet<u32> =
+            search_boundary::uid_search(&mut conn, &search_criteria, self.imap_operation_timeout())
+                .await?;
+
+        let mut uid_list: Vec<u32> = uids.into_iter().collect();
+        uid_list.sort_by(|a, b| b.cmp(a)); // newest first
+        uid_list.truncate(limit as usize);
+
+        let mut items: Vec<EmailSummary> = Vec::new();
+        if !uid_list.is_empty() {
+            let uid_set = uid_list
+                .iter()
+                .map(|u| u.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let fetches = conn
+                .uid_fetch(&uid_set, "(ENVELOPE FLAGS RFC822.SIZE)")
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            let fetches_vec: Vec<_> = fetches
+                .try_collect()
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            items = fetches_vec
+                .into_iter()
+                .filter_map(|f| f.uid.map(|uid| message::extract_summary(uid, &f)))
+                .filter(|e| !e.flags.iter().any(|f| flag_is_seen(f)))
+                .collect();
+        }
+
+        let payload = serde_json::json!({
+            "folder": resolved_folder,
+            "count": items.len(),
+            "uids": items.iter().map(|e| e.uid).collect::<Vec<_>>(),
+            "items": items,
+            "error": serde_json::Value::Null,
+        });
+        Ok(CallToolResult::success(vec![
+            Content::json(&payload).map_err(|e| McpError::internal_error(e.to_string(), None))?,
         ]))
     }
 
@@ -836,7 +1049,7 @@ impl EmailServer {
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         let fetches = conn
-            .uid_fetch(&params.uid.to_string(), "(RFC822 FLAGS)")
+            .uid_fetch(&params.uid.to_string(), "(BODY.PEEK[] FLAGS)")
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
@@ -883,7 +1096,7 @@ impl EmailServer {
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         let fetches = conn
-            .uid_fetch(&params.uid.to_string(), "(RFC822)")
+            .uid_fetch(&params.uid.to_string(), "(BODY.PEEK[])")
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
@@ -926,7 +1139,7 @@ impl EmailServer {
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         let fetches = conn
-            .uid_fetch(&params.uid.to_string(), "(RFC822)")
+            .uid_fetch(&params.uid.to_string(), "(BODY.PEEK[])")
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
@@ -991,16 +1204,22 @@ impl EmailServer {
         let mut has_string_criteria = false;
         let mut gmail_raw_terms: Vec<String> = Vec::new();
 
-        let push_gmail = |terms: &mut Vec<String>, key: &str, value: &str| {
-            // X-GM-RAW values are quoted; escape backslash and double-quote
-            // so user input with quotes does not break the search.
-            terms.push(format!("{key}:\"{}\"", escape_imap_literal(value)));
-        };
+        // X-GM-RAW terms are composed by gmail_search_term(): bare tokens
+        // stay UNQUOTED (a quoted value is an exact-phrase match in the
+        // Gmail search language and does not match e.g. a domain prefix),
+        // phrases stay quoted, non-expressible values are refused loudly.
+        // IMAP-level escaping of the whole X-GM-RAW argument happens once,
+        // at the composition site below (escape_imap_literal(&raw)).
+        let push_gmail =
+            |terms: &mut Vec<String>, key: &str, value: &str| -> Result<(), McpError> {
+                terms.push(gmail_search_term(Some(key), value)?);
+                Ok(())
+            };
 
         if let Some(ref subject) = params.subject {
             has_string_criteria = true;
             if is_gmail {
-                push_gmail(&mut gmail_raw_terms, "subject", subject);
+                push_gmail(&mut gmail_raw_terms, "subject", subject)?;
             } else {
                 criteria.push_str(&format!("SUBJECT \"{}\" ", escape_imap_literal(subject)));
             }
@@ -1008,7 +1227,7 @@ impl EmailServer {
         if let Some(ref from) = params.from {
             has_string_criteria = true;
             if is_gmail {
-                push_gmail(&mut gmail_raw_terms, "from", from);
+                push_gmail(&mut gmail_raw_terms, "from", from)?;
             } else {
                 criteria.push_str(&format!("FROM \"{}\" ", escape_imap_literal(from)));
             }
@@ -1016,9 +1235,11 @@ impl EmailServer {
         if let Some(ref body) = params.body {
             has_string_criteria = true;
             if is_gmail {
-                // Gmail bare-term inside quotes searches body+subject; this
-                // matches the user's intent better than SEARCH BODY.
-                gmail_raw_terms.push(format!("\"{}\"", escape_imap_literal(body)));
+                // Gmail bare term searches body+subject; this matches the
+                // user's intent better than SEARCH BODY. Quoting follows
+                // gmail_search_term(): bare token = word match, otherwise
+                // exact phrase.
+                gmail_raw_terms.push(gmail_search_term(None, body)?);
             } else {
                 criteria.push_str(&format!("BODY \"{}\" ", escape_imap_literal(body)));
             }
@@ -1026,7 +1247,7 @@ impl EmailServer {
         if let Some(ref to) = params.to {
             has_string_criteria = true;
             if is_gmail {
-                push_gmail(&mut gmail_raw_terms, "to", to);
+                push_gmail(&mut gmail_raw_terms, "to", to)?;
             } else {
                 criteria.push_str(&format!("TO \"{}\" ", escape_imap_literal(to)));
             }
@@ -1034,16 +1255,16 @@ impl EmailServer {
         if let Some(ref cc) = params.cc {
             has_string_criteria = true;
             if is_gmail {
-                push_gmail(&mut gmail_raw_terms, "cc", cc);
+                push_gmail(&mut gmail_raw_terms, "cc", cc)?;
             } else {
                 criteria.push_str(&format!("CC \"{}\" ", escape_imap_literal(cc)));
             }
         }
         if let Some(ref before) = params.before {
-            criteria.push_str(&format!("BEFORE {} ", validate_imap_date(before)?));
+            criteria.push_str(&format!("BEFORE {} ", normalize_imap_date(before)?));
         }
         if let Some(ref since) = params.since {
-            criteria.push_str(&format!("SINCE {} ", validate_imap_date(since)?));
+            criteria.push_str(&format!("SINCE {} ", normalize_imap_date(since)?));
         }
         if let Some(ref header) = params.header {
             // RFC-3501 HEADER criterion: `HEADER <field-name> <quoted-value>`.
@@ -1086,10 +1307,9 @@ impl EmailServer {
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-        let uids: std::collections::HashSet<u32> = conn
-            .uid_search(&criteria)
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let uids: std::collections::HashSet<u32> =
+            search_boundary::uid_search(&mut conn, &criteria, self.imap_operation_timeout())
+                .await?;
 
         let mut uid_list: Vec<u32> = uids.into_iter().collect();
         uid_list.sort_by(|a, b| b.cmp(a));
@@ -1292,10 +1512,8 @@ impl EmailServer {
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-        let uids: std::collections::HashSet<u32> = conn
-            .uid_search("ALL")
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let uids: std::collections::HashSet<u32> =
+            search_boundary::uid_search(&mut conn, "ALL", self.imap_operation_timeout()).await?;
 
         let mut uid_list: Vec<u32> = uids.into_iter().collect();
         uid_list.sort_by(|a, b| b.cmp(a));
@@ -1796,10 +2014,9 @@ impl EmailServer {
             criteria.push_str(&format!(" FROM \"{}\"", escape_imap_literal(from)));
         }
 
-        let uids: std::collections::HashSet<u32> = conn
-            .uid_search(&criteria)
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let uids: std::collections::HashSet<u32> =
+            search_boundary::uid_search(&mut conn, &criteria, self.imap_operation_timeout())
+                .await?;
 
         if uids.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
@@ -1849,11 +2066,10 @@ impl EmailServer {
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-        let initial_count = conn
-            .uid_search("ALL")
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?
-            .len();
+        let initial_count =
+            search_boundary::uid_search(&mut conn, "ALL", self.imap_operation_timeout())
+                .await?
+                .len();
 
         let start = std::time::Instant::now();
         let timeout = std::time::Duration::from_secs(timeout_secs);
@@ -1866,11 +2082,10 @@ impl EmailServer {
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-            let current_count = conn
-                .uid_search("ALL")
-                .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?
-                .len();
+            let current_count =
+                search_boundary::uid_search(&mut conn, "ALL", self.imap_operation_timeout())
+                    .await?
+                    .len();
 
             if current_count != initial_count {
                 return Ok(CallToolResult::success(vec![
@@ -1922,14 +2137,16 @@ impl EmailServer {
         if params.unseen_only.unwrap_or(false) {
             search_criteria.push_str("UNSEEN ");
         }
+        if let Some(ref date) = params.since_date {
+            search_criteria.push_str(&format!("SINCE {} ", normalize_imap_date(date)?));
+        }
         if search_criteria.is_empty() {
             search_criteria = "ALL".to_string();
         }
 
-        let uids: std::collections::HashSet<u32> = conn
-            .uid_search(&search_criteria)
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let uids: std::collections::HashSet<u32> =
+            search_boundary::uid_search(&mut conn, &search_criteria, self.imap_operation_timeout())
+                .await?;
 
         let mut uid_list: Vec<u32> = uids.into_iter().collect();
         uid_list.sort_by(|a, b| b.cmp(a));
@@ -1949,7 +2166,7 @@ impl EmailServer {
         }
         let header_fields = params.headers.join(" ");
         let fetch_items =
-            format!("(ENVELOPE FLAGS RFC822.SIZE BODY[HEADER.FIELDS ({header_fields})])");
+            format!("(ENVELOPE FLAGS RFC822.SIZE BODY.PEEK[HEADER.FIELDS ({header_fields})])");
 
         let uid_set = uid_list
             .iter()
@@ -1967,14 +2184,30 @@ impl EmailServer {
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
+        let unseen_only = params.unseen_only.unwrap_or(false);
         let results: Vec<serde_json::Value> = fetches_vec
             .into_iter()
             .filter_map(|f| {
                 let uid = f.uid?;
                 let summary = message::extract_summary(uid, &f);
+                // The fetch asks for BODY[HEADER.FIELDS (...)] and the
+                // server echoes that section back as
+                // BodySection { section: Some(Full(Header)) }: only the
+                // header() accessor matches that shape (body() matches
+                // section: None / Rfc822 and returns None here).
+                if unseen_only
+                    && summary
+                        .flags
+                        .iter()
+                        .any(|flag| crate::server::flag_is_seen(flag))
+                {
+                    // Belt-and-braces: a SEARCH UNSEEN that lies must not
+                    // surface already-seen rows.
+                    return None;
+                }
                 let headers_text = f
-                    .body()
-                    .map(|b| String::from_utf8_lossy(b).into_owned())
+                    .header()
+                    .map(|h| String::from_utf8_lossy(h).into_owned())
                     .unwrap_or_default();
                 Some(serde_json::json!({
                     "uid": uid,
@@ -2158,6 +2391,11 @@ impl EmailServer {
 // ── Helper methods ──────────────────────────────────────────────
 
 impl EmailServer {
+    /// Timeout operativo delle singole operazioni IMAP, dalla configurazione.
+    fn imap_operation_timeout(&self) -> std::time::Duration {
+        self.provider.imap_pool().operation_timeout()
+    }
+
     async fn get_imap_connection(
         &self,
     ) -> Result<bb8::PooledConnection<'_, crate::pool::ImapConnectionManager>, McpError> {
@@ -2374,6 +2612,7 @@ mod contract_tests {
             "move_thread",
             "idle_wait",
             "list_emails_with_headers",
+            "list_recent_unseen",
         ] {
             assert!(names.contains(required), "missing email tool {required}");
         }
@@ -2470,5 +2709,58 @@ mod contract_tests {
             props.contains_key("from"),
             "send_email must expose `from` as optional override"
         );
+    }
+
+    #[test]
+    fn normalize_imap_date_accepts_iso_and_imap_forms() {
+        assert_eq!(
+            normalize_imap_date("2026-08-30").unwrap(),
+            "30-Aug-2026".to_string()
+        );
+        assert_eq!(
+            normalize_imap_date("30-Aug-2026").unwrap(),
+            "30-Aug-2026".to_string()
+        );
+        // month name case-insensitive, normalized to title case
+        assert_eq!(
+            normalize_imap_date("1-aug-2026").unwrap(),
+            "01-Aug-2026".to_string()
+        );
+        // leap-year February 29 is accepted and normalized
+        assert_eq!(
+            normalize_imap_date("2024-02-29").unwrap(),
+            "29-Feb-2024".to_string()
+        );
+        // ...while 29 February on a non-leap year is rejected
+        assert!(normalize_imap_date("2026-02-29").is_err());
+    }
+
+    #[test]
+    fn normalize_imap_date_rejects_with_named_formats() {
+        for bad in [
+            "30/08/2026", // the other reasonable-but-wrong guess
+            "2026-13-01", // month out of range
+            "2026-02-30", // day out of range for February
+            "2026-08",    // incomplete
+            "yesterday",  // free text
+            "",           // empty
+        ] {
+            let err = normalize_imap_date(bad).unwrap_err();
+            let message = err.message.clone();
+            assert!(
+                message.contains("YYYY-MM-DD") && message.contains("dd-Mon-yyyy"),
+                "date error must name both accepted formats, got: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn flag_is_seen_matches_both_renderings() {
+        assert!(flag_is_seen("Seen"));
+        assert!(flag_is_seen("\\Seen"));
+        assert!(!flag_is_seen("Unseen"));
+        assert!(!flag_is_seen("Recent"));
+        assert!(!flag_is_seen("Flagged"));
+        assert!(!flag_is_seen(""));
     }
 }

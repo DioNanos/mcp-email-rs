@@ -227,6 +227,7 @@ pub struct PoolMetrics {
 
 pub struct ImapPool {
     pool: Pool<ImapConnectionManager>,
+    operation_timeout: Duration,
 }
 
 impl ImapPool {
@@ -247,7 +248,10 @@ impl ImapPool {
             .max_lifetime(Some(Duration::from_secs(1800)))
             .build_unchecked(manager);
 
-        Self { pool }
+        Self {
+            pool,
+            operation_timeout: Duration::from_secs(config.operation_timeout_secs),
+        }
     }
 
     pub async fn get(
@@ -257,6 +261,11 @@ impl ImapPool {
             .get()
             .await
             .map_err(|e| EmailError::Pool(e.to_string()))
+    }
+
+    /// Timeout operativo delle singole operazioni IMAP.
+    pub fn operation_timeout(&self) -> Duration {
+        self.operation_timeout
     }
 
     /// Get current pool state for diagnostics
