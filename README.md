@@ -44,6 +44,17 @@ Design choices that follow from that:
 
 ## Install
 
+**Quick install (Linux / Termux)** — downloads the right prebuilt for your
+platform, verifies its checksum, and installs atomically to `~/.local/bin`:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/DioNanos/mcp-email-rs/main/install.sh
+less install.sh   # always read scripts before running them
+bash install.sh            # latest release
+bash install.sh --version v0.3.3   # or pin a version
+```
+
+
 **Prebuilt binary** (recommended) — download the archive for your platform from
 the [latest release](https://github.com/DioNanos/mcp-email-rs/releases/latest),
 extract, and point your MCP client at the binary:
