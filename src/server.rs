@@ -56,8 +56,8 @@ pub(crate) fn flag_is_seen(flag: &str) -> bool {
 
 /// Normalize a user-supplied date to the IMAP SEARCH form `dd-Mon-yyyy`.
 ///
-/// Accepts ISO `YYYY-MM-DD` (the format every caller reasonably tries first,
-/// see the 2026-08-31 Personal handoff) and the native IMAP form
+/// Accepts ISO `YYYY-MM-DD` (the format every caller reasonably tries first)
+/// and the native IMAP form
 /// (`dd-Mon-yyyy`, month name case-insensitive, normalized to title case).
 /// The error always names both accepted formats: a date mistake must reach
 /// the caller as an MCP error, never collapse into "zero emails".
@@ -228,6 +228,232 @@ fn download_base_dir() -> PathBuf {
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
+/// Outcome of removing messages marked \Deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpungeOutcome {
+    /// UIDPLUS: UID EXPUNGE mirato sui soli uid richiesti.
+    Targeted,
+    /// Without UIDPLUS: NO expunge. A global EXPUNGE removes every message
+    /// marked \Deleted, and a prior snapshot of the state does not close the
+    /// window in which another client marks others. The requested messages
+    /// stay marked and the response states the deferral.
+    DeferredMarkedOnly,
+}
+
+// Esito di un APPEND di draft: `new_uid` e' Some solo quando il server ha
+// restituito l'APPENDUID response code (RFC 4315, UIDPLUS).
+struct DraftAppendOutcome {
+    new_uid: Option<u32>,
+}
+
+/// Manual APPEND of a message into the draft folder.
+///
+/// Why NOT `Session::append`: it consumes the tagged response and loses the
+/// `[APPENDUID uidvalidity uid]` response code, and it cannot tell a definite
+/// failure from an UNCERTAIN outcome. Here:
+/// - failure BEFORE the literal is sent (server answers NO/BAD to the APPEND
+///   command, or the connection drops at once): a definite error, the old
+///   draft is intact by construction because no destructive step has
+///   happened yet;
+/// - failure AFTER the literal is sent (connection dropped or peer silent
+///   waiting for the tagged OK): an explicitly declared UNCERTAIN outcome —
+///   the server MAY have stored the message; the caller must not retry
+///   blindly;
+/// - success: parse APPENDUID to return the new UID.
+///
+/// The receiver is a real state machine: the server may send untagged data
+/// before the continuation (RFC 3501 §2.2.1) and it is consumed without
+/// concluding a false rejection; every read has an operational timeout: a
+/// connected but silent peer yields the uncertain outcome, not an infinite
+/// wait. A session left mid-command must be DISCARDED by the caller (which is
+/// why the append runs on a dedicated connection, see update_draft).
+async fn append_new_draft(
+    session: &mut crate::pool::TlsImapSession,
+    mailbox: &str,
+    raw: &[u8],
+    operation_timeout: std::time::Duration,
+) -> Result<DraftAppendOutcome, McpError> {
+    use async_imap::imap_proto::types::{Response, ResponseCode, Status};
+
+    // The limit is an OVERALL DEADLINE on the operation (from the APPEND
+    // command to the final response), not a timeout that rearms on every
+    // read: a server sending untagged traffic forever cannot keep the
+    // connection open indefinitely.
+    let deadline = tokio::time::Instant::now() + operation_timeout;
+    let remaining =
+        || deadline.saturating_duration_since(tokio::time::Instant::now());
+
+    // Quoting RFC 3501 della mailbox (l'helper `validate_str` della crate
+    // non e' pubblico): backslash e doppi apici escaped dentro "...".
+    let mailbox_quoted = format!("\"{}\"", mailbox.replace('\\', "\\\\").replace('"', "\\\""));
+    let id = tokio::time::timeout(
+        remaining(),
+        session.run_command(format!("APPEND {} {{{}}}", mailbox_quoted, raw.len())),
+    )
+    .await
+    .map_err(|_| {
+        McpError::internal_error(
+            "draft APPEND abandoned: the operation deadline expired BEFORE the literal was sent; the message was NOT transferred and the old draft is intact; the connection was discarded",
+            None,
+        )
+    })?
+    .map_err(|e| {
+        McpError::internal_error(
+            format!("draft APPEND command failed before any destructive step (old draft intact): {e}"),
+            None,
+        )
+    })?;
+    let id_text = id.0.clone();
+
+    // Phase 1 — waiting for the continuation. The server may legitimately
+    // send untagged responses before the continuation: they are consumed and
+    // the loop continues up to the continuation (proceed) or a tagged
+    // response for our tag (definite rejection).
+    loop {
+        match tokio::time::timeout(remaining(), session.read_response()).await {
+            Err(_elapsed) => {
+                return Err(McpError::internal_error(
+                    "draft APPEND abandoned: the operation deadline expired BEFORE the literal was sent (untagged traffic or silence kept the APPEND open); the message was NOT transferred and the old draft is intact; the connection was discarded",
+                    None,
+                ));
+            }
+            Ok(Err(e)) => {
+                return Err(McpError::internal_error(
+                    format!(
+                        "draft APPEND failed before the literal was sent (old draft intact, definite failure): {e}"
+                    ),
+                    None,
+                ));
+            }
+            Ok(Ok(None)) => {
+                return Err(McpError::internal_error(
+                    "draft APPEND failed before the literal was sent (old draft intact, definite failure): connection closed",
+                    None,
+                ));
+            }
+            Ok(Ok(Some(res))) => match res.parsed() {
+                Response::Continue { .. } => break,
+                Response::Done {
+                    tag,
+                    status,
+                    information,
+                    ..
+                } if tag.0 == id_text => {
+                    let information = information.as_deref().unwrap_or("");
+                    return Err(McpError::internal_error(
+                        format!(
+                            "draft APPEND rejected by the server before the literal was sent (old draft intact, definite failure): {status:?} {information}"
+                        ),
+                        None,
+                    ));
+                }
+                _ => continue, // untagged prima della continuation: consuma e prosegui
+            },
+        }
+    }
+
+    // The literal was accepted: from here an I/O error no longer defines the
+    // append as failed, but as an UNCERTAIN outcome. The WRITE is also inside
+    // the overall deadline — a blocked write (a peer that does not read)
+    // cannot stay suspended without a limit.
+    {
+        use tokio::io::AsyncWriteExt;
+        let stream = session.as_mut();
+        write_with_deadline(stream, raw, remaining()).await?;
+        write_with_deadline(stream, b"\r\n", remaining()).await?;
+        let remaining = remaining();
+        match tokio::time::timeout(remaining, stream.flush()).await {
+            Err(_) => {
+                return Err(append_uncertain(
+                    "literal flush timed out: part of the message may have been transferred"
+                        .to_string(),
+                ));
+            }
+            Ok(Err(e)) => return Err(append_uncertain(e.to_string())),
+            Ok(Ok(())) => {}
+        }
+    }
+
+    loop {
+        let res = match tokio::time::timeout(remaining(), session.read_response()).await {
+            Err(_elapsed) => {
+                return Err(append_uncertain(
+                    "the operation deadline expired while waiting for the APPEND result (silence or unbounded untagged traffic): the message literal WAS transferred, so the server may or may not have stored it"
+                        .to_string(),
+                ));
+            }
+            Ok(Err(e)) => return Err(append_uncertain(e.to_string())),
+            Ok(Ok(None)) => {
+                return Err(append_uncertain(
+                    "connection closed while waiting for the APPEND result".to_string(),
+                ));
+            }
+            Ok(Ok(Some(res))) => res,
+        };
+        let Response::Done {
+            tag,
+            status,
+            code,
+            information,
+        } = res.parsed()
+        else {
+            // Risposte untagged (EXISTS, FETCH, ...) durante l'append: ignora.
+            continue;
+        };
+        if tag.0 != id_text {
+            continue;
+        }
+        let information = information.as_deref().unwrap_or("");
+        if *status != Status::Ok {
+            return Err(McpError::internal_error(
+                format!(
+                    "draft APPEND rejected by the server after the literal was sent (old draft intact, definite failure): {information}"
+                ),
+                None,
+            ));
+        }
+        let new_uid = match code.as_ref() {
+            Some(ResponseCode::AppendUid(_uidvalidity, uids)) => {
+                // L'ultimo elemento dell'uid-set e' l'uid del messaggio appena
+                // appeso; gli intervalli si riducono al loro estremo superiore.
+                uids.iter().next_back().map(|m| match m {
+                    async_imap::imap_proto::types::UidSetMember::Uid(u) => *u,
+                    async_imap::imap_proto::types::UidSetMember::UidRange(r) => *r.end(),
+                })
+            }
+            _ => None,
+        };
+        return Ok(DraftAppendOutcome { new_uid });
+    }
+}
+
+/// Write of a literal chunk within the overall deadline: a blocked write (a
+/// peer that does not read) must produce the uncertain outcome within the
+/// limit, not stay suspended forever.
+async fn write_with_deadline(
+    stream: &mut tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+    chunk: &[u8],
+    remaining: std::time::Duration,
+) -> Result<(), McpError> {
+    use tokio::io::AsyncWriteExt;
+    match tokio::time::timeout(remaining, stream.write_all(chunk)).await {
+        Err(_) => Err(append_uncertain(
+            "literal write timed out: part of the message may have been transferred".to_string(),
+        )),
+        Ok(Err(e)) => Err(append_uncertain(e.to_string())),
+        Ok(Ok(())) => Ok(()),
+    }
+}
+
+fn append_uncertain(detail: String) -> McpError {
+    McpError::internal_error(
+        format!(
+            "draft APPEND outcome UNCERTAIN: the message literal was already sent but the final result was not received ({detail}). The old draft was left intact and NO retry was attempted: verify on the server whether the new draft arrived before repeating the operation"
+        ),
+        None,
+    )
+}
+
 // ── Tool parameter types ────────────────────────────────────────
 
 macro_rules! impl_schema {
@@ -329,19 +555,54 @@ impl_schema!(SearchEmailsParams, "SearchEmailsParams", {
     "additionalProperties": false
 });
 
+/// One file to attach, read by the SERVER from `EMAIL_ATTACH_DIR`. Never base64:
+/// the server reads the local file, the model never carries bytes.
+///
+/// - `path`: RELATIVE path under `EMAIL_ATTACH_DIR`. Absolute paths, `..` and
+///   symlinks (including intermediate ones) are rejected; opening is atomic via
+///   `openat2(RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS)` and only regular files are
+///   accepted.
+/// - `filename`: name exposed in the email. Default: basename of `path`.
+///   Rejected: empty, `.`, `..`, path separators, CR/LF.
+/// - `mime`: explicit `type/subtype` (RFC token, no parameters). Default:
+///   case-insensitive extension map (pdf, jpg, jpeg, png, docx, txt) with
+///   fallback `application/octet-stream`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(inline)]
+pub struct AttachmentParam {
+    /// Relative path under `EMAIL_ATTACH_DIR` (absolute paths, `..` and symlinks rejected).
+    pub path: String,
+    /// Name exposed in the email; defaults to the basename of `path`. Path separators and CR/LF rejected.
+    pub filename: Option<String>,
+    /// Explicit MIME `type/subtype`; defaults from the extension map, fallback `application/octet-stream`.
+    pub mime: Option<String>,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SendEmailParams {
+    /// Primary recipients: a single address or a comma/semicolon separated
+    /// list (`a@x.test, b@x.test`); quoted display names are supported
+    /// (`"Doe, John" <a@x.test>`). RFC 5322 groups and comments are rejected.
     pub to: String,
     pub subject: String,
     pub body: Option<String>,
     pub html: Option<String>,
+    /// Carbon-copy recipients: same list syntax as `to`; omit or `null`
+    /// for none.
     pub cc: Option<String>,
+    /// Blind carbon-copy recipients: same list syntax as `to`. They are
+    /// NEVER written in the message headers: they receive the message via
+    /// the SMTP envelope only (RFC 5322 §3.6.3). Omit or `null` for none.
     pub bcc: Option<String>,
     pub reply_to: Option<String>,
     pub in_reply_to: Option<String>,
     pub references: Option<String>,
     /// Override sender address. Must match one of `smtp.allowed_from` when configured.
     pub from: Option<String>,
+    /// Files to attach, read by the server from `EMAIL_ATTACH_DIR` (relative
+    /// paths; never base64). When `EMAIL_ATTACH_DIR` is not configured, any
+    /// request carrying attachments is rejected with an explicit error.
+    pub attachments: Option<Vec<AttachmentParam>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -437,12 +698,24 @@ impl_schema!(ListDraftsParams, "ListDraftsParams", {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CreateDraftParams {
+    /// Primary recipients: a single address or a comma/semicolon separated
+    /// list; quoted display names are supported. RFC 5322 groups and
+    /// comments are rejected.
     pub to: String,
     pub subject: String,
     pub body: Option<String>,
     pub html: Option<String>,
+    /// Carbon-copy recipients: same list syntax as `to`; omit or `null`
+    /// for none.
     pub cc: Option<String>,
+    /// Blind carbon-copy recipients: same list syntax as `to`. The private
+    /// IMAP draft KEEPS the Bcc header (so the draft stays editable);
+    /// the Bcc header is stripped when the message is sent.
     pub bcc: Option<String>,
+    /// Files to attach, read by the server from `EMAIL_ATTACH_DIR` (relative
+    /// paths; never base64). When `EMAIL_ATTACH_DIR` is not configured, any
+    /// request carrying attachments is rejected with an explicit error.
+    pub attachments: Option<Vec<AttachmentParam>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -454,18 +727,37 @@ pub struct UpdateDraftParams {
     pub html: Option<String>,
     pub cc: Option<String>,
     pub bcc: Option<String>,
+    /// Files to attach, read by the server from `EMAIL_ATTACH_DIR` (relative
+    /// paths; never base64). NO implicit preservation: omitting `attachments`
+    /// or passing `[]` produces a draft WITHOUT attachments; re-attach
+    /// explicitly what you want to keep.
+    pub attachments: Option<Vec<AttachmentParam>>,
 }
 
 impl_schema!(UpdateDraftParams, "UpdateDraftParams", {
     "type": "object",
     "properties": {
         "uid": { "type": "integer", "minimum": 1 },
-        "to": { "type": "string" },
+        "to": { "type": "string", "description": "Primary recipients: a single address or a comma/semicolon separated list; quoted display names are supported. RFC 5322 groups and comments are rejected." },
         "subject": { "type": "string" },
         "body": { "type": "string" },
         "html": { "type": "string" },
-        "cc": { "type": "string" },
-        "bcc": { "type": "string" }
+        "cc": { "type": "string", "description": "Carbon-copy recipients: same list syntax as `to`. FULL REPLACEMENT: omitting cc removes the Cc header from the new draft." },
+        "bcc": { "type": "string", "description": "Blind carbon-copy recipients: same list syntax as `to`; the private draft keeps the Bcc header (stripped when sending). FULL REPLACEMENT: omitting bcc removes the Bcc header from the new draft." },
+        "attachments": {
+            "type": "array",
+            "description": "Files to attach, read by the server from EMAIL_ATTACH_DIR (relative paths; never base64). NO implicit preservation: omitting attachments or passing [] produces a draft WITHOUT attachments; re-attach explicitly what you want to keep.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Relative path under EMAIL_ATTACH_DIR (absolute paths, .. and symlinks rejected)." },
+                    "filename": { "type": "string", "description": "Name exposed in the email; defaults to the basename of path. Path separators and CR/LF rejected." },
+                    "mime": { "type": "string", "description": "Explicit MIME type/subtype; defaults from the extension map, fallback application/octet-stream." }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }
+        }
     },
     "required": ["uid", "to", "subject"],
     "additionalProperties": false
@@ -955,7 +1247,7 @@ impl EmailServer {
             .collect();
         if params.unseen_only.unwrap_or(false) {
             // Belt-and-braces: a SEARCH UNSEEN that lies must not surface
-            // already-seen rows (2026-08-31 Personal handoff, finding #1).
+            // already-seen rows.
             emails.retain(|e| !e.flags.iter().any(|f| flag_is_seen(f)));
         }
 
@@ -1191,8 +1483,8 @@ impl EmailServer {
         let limit = params.limit.unwrap_or(20);
 
         // Gmail IMAP returns an empty set for SUBJECT/FROM/BODY/TO/CC string
-        // criteria sent the RFC-3501 way (observed end-to-end via mcp-email-rs
-        // Step 0 DMARC audit), even when CHARSET UTF-8 is declared. The
+        // criteria sent the RFC-3501 way (observed end-to-end while testing
+        // DMARC delivery), even when CHARSET UTF-8 is declared. The
         // Gmail-specific extension `X-GM-RAW` accepts a Gmail-search-language
         // query and behaves like the web UI search box — this is what every
         // working Gmail IMAP client falls back to. We detect the provider
@@ -1349,14 +1641,12 @@ impl EmailServer {
 
     // ── Send and drafts ─────────────────────────────────────────
 
-    #[tool(description = "Send an email via SMTP")]
+    #[tool(description = "Send an email via SMTP. `to`, `cc` and `bcc` accept a single address or a comma/semicolon separated list; Bcc recipients go in the SMTP envelope only and are never written in the message headers (RFC 5322 §3.6.3)")]
     async fn send_email(
         &self,
         params: Parameters<SendEmailParams>,
     ) -> Result<CallToolResult, McpError> {
         use lettre::AsyncTransport;
-        use lettre::Message;
-        use lettre::message::{MultiPart, SinglePart, header::ContentType};
 
         let params = params.0;
 
@@ -1365,95 +1655,43 @@ impl EmailServer {
             self.provider.default_from(),
             self.provider.allowed_from(),
         )?;
-
         let from_addr: &str = params
             .from
             .as_deref()
             .unwrap_or_else(|| self.provider.default_from());
 
-        let mut builder = Message::builder()
-            .from(
-                from_addr
-                    .parse()
-                    .map_err(|e| McpError::internal_error(format!("Invalid from: {e}"), None))?,
-            )
-            .to(params
-                .to
-                .parse()
-                .map_err(|e| McpError::internal_error(format!("Invalid to: {e}"), None))?)
-            .subject(&params.subject);
-
-        if let Some(ref cc) = params.cc {
-            builder = builder.cc(cc
-                .parse()
-                .map_err(|e| McpError::internal_error(format!("Invalid cc: {e}"), None))?);
-        }
-
-        if let Some(ref bcc) = params.bcc {
-            builder =
-                builder
-                    .bcc(bcc.parse().map_err(|e| {
-                        McpError::internal_error(format!("Invalid bcc: {e}"), None)
-                    })?);
-        }
-
-        if let Some(ref reply_to) = params.reply_to {
-            builder =
-                builder.reply_to(reply_to.parse().map_err(|e| {
-                    McpError::internal_error(format!("Invalid reply_to: {e}"), None)
-                })?);
-        }
-
-        // Threading headers
-        if let Some(ref irt) = params.in_reply_to {
-            builder = builder.in_reply_to(irt.clone());
-        }
-        if let Some(ref refs) = params.references {
-            builder = builder.references(refs.clone());
-        }
-
-        let email = if params.html.is_some() {
-            builder.multipart(
-                MultiPart::alternative()
-                    .singlepart(
-                        SinglePart::builder()
-                            .header(ContentType::TEXT_PLAIN)
-                            .body(params.body.unwrap_or_default()),
-                    )
-                    .singlepart(
-                        SinglePart::builder()
-                            .header(ContentType::TEXT_HTML)
-                            .body(params.html.unwrap_or_default()),
-                    ),
-            )
-        } else {
-            builder.singlepart(
-                SinglePart::builder()
-                    .header(ContentType::TEXT_PLAIN)
-                    .body(params.body.unwrap_or_default()),
-            )
-        }
-        .map_err(|e| McpError::internal_error(format!("Failed to build email: {e}"), None))?;
+        let email = self.compose_send_email(&params)?;
 
         // Get raw bytes for IMAP append BEFORE sending
         let raw = email.formatted();
 
         let mailer = self.get_smtp_transport().await?;
 
-        // Try send; on transient failure, rebuild transport and retry once
+        // Try send; on transient failure, rebuild transport and retry once.
+        // Failure descriptions are CLASSIFIED (severity + numeric code
+        // only): the raw server text may quote the refused recipient — and
+        // a Bcc recipient is envelope-only — so it never reaches the log
+        // or the client, on the initial failure nor on the retry.
         let send_result = mailer.send(email.clone()).await;
         let send_result = match send_result {
             Ok(_) => Ok(()),
             Err(e) if e.is_transient() => {
-                tracing::warn!("SMTP transient error, rebuilding transport: {e}");
+                tracing::warn!(
+                    "SMTP send failed ({}); rebuilding transport and retrying once",
+                    classify_smtp_send_failure(&e)
+                );
                 self.rebuild_smtp_transport().await?;
                 let mailer = self.get_smtp_transport().await?;
                 mailer.send(email).await.map(|_| ())
             }
             Err(e) => Err(e),
         };
-        send_result
-            .map_err(|e| McpError::internal_error(format!("SMTP send failed: {e}"), None))?;
+        send_result.map_err(|e| {
+            McpError::internal_error(
+                format!("SMTP send failed: {}", classify_smtp_send_failure(&e)),
+                None,
+            )
+        })?;
 
         // Append actual email to Sent folder via IMAP, unless the SMTP server
         // already auto-saves (Gmail/Outlook/Office 365). The resolved mode is
@@ -1479,10 +1717,22 @@ impl EmailServer {
             crate::config::SaveSentMode::Never => false,
         };
 
+        // No raw recipient text and no Bcc addresses in logs — only
+        // per-field entry counts.
         tracing::info!(
             target: "audit::send_email",
             from = %from_addr,
-            to = %params.to,
+            to_recipients = crate::recipients::entry_count(&params.to),
+            cc_recipients = params
+                .cc
+                .as_deref()
+                .map(crate::recipients::entry_count)
+                .unwrap_or(0),
+            bcc_recipients = params
+                .bcc
+                .as_deref()
+                .map(crate::recipients::entry_count)
+                .unwrap_or(0),
             subject_len = params.subject.len(),
             in_reply_to = ?params.in_reply_to,
             save_sent_executed,
@@ -1551,50 +1801,13 @@ impl EmailServer {
         ]))
     }
 
-    #[tool(description = "Create a new draft email")]
+    #[tool(description = "Create a new draft email. `to`, `cc` and `bcc` accept a single address or a comma/semicolon separated list; Cc and Bcc headers are stored in the private IMAP draft (Bcc included, so the draft stays editable; it is stripped when sending)")]
     async fn create_draft(
         &self,
         params: Parameters<CreateDraftParams>,
     ) -> Result<CallToolResult, McpError> {
-        use lettre::Message;
-        use lettre::message::{MultiPart, SinglePart, header::ContentType};
-
         let params = params.0;
-        let from_addr = self.provider.default_from();
-        let email = Message::builder()
-            .from(
-                from_addr
-                    .parse()
-                    .map_err(|e| McpError::internal_error(format!("Invalid from: {e}"), None))?,
-            )
-            .to(params
-                .to
-                .parse()
-                .map_err(|e| McpError::internal_error(format!("Invalid to: {e}"), None))?)
-            .subject(&params.subject);
-
-        let email = if params.html.is_some() {
-            email.multipart(
-                MultiPart::alternative()
-                    .singlepart(
-                        SinglePart::builder()
-                            .header(ContentType::TEXT_PLAIN)
-                            .body(params.body.unwrap_or_default()),
-                    )
-                    .singlepart(
-                        SinglePart::builder()
-                            .header(ContentType::TEXT_HTML)
-                            .body(params.html.unwrap_or_default()),
-                    ),
-            )
-        } else {
-            email.singlepart(
-                SinglePart::builder()
-                    .header(ContentType::TEXT_PLAIN)
-                    .body(params.body.unwrap_or_default()),
-            )
-        }
-        .map_err(|e| McpError::internal_error(format!("Failed to build draft: {e}"), None))?;
+        let email = self.compose_create_draft(&params)?;
 
         let raw = email.formatted();
 
@@ -1613,12 +1826,19 @@ impl EmailServer {
         )]))
     }
 
-    #[tool(description = "Update an existing draft (delete old, create new)")]
+    #[tool(description = "Update an existing draft: the new version is APPENDed first and only after confirmed success the old draft is removed with a targeted UID EXPUNGE; without UIDPLUS the old draft is preserved (partial substitution, never a global EXPUNGE). Returns the new UID when the server provides APPENDUID. `to`, `cc` and `bcc` accept a single address or a comma/semicolon separated list and are FULL REPLACEMENT: omitting `cc`/`bcc` removes those headers from the new draft (Cc and Bcc are stored in the private draft, Bcc included; it is stripped when sending)")]
     async fn update_draft(
         &self,
         params: Parameters<UpdateDraftParams>,
     ) -> Result<CallToolResult, McpError> {
         let params = params.0;
+        let old_uid = params.uid;
+
+        // 1. Compose and validate EVERYTHING first: with invalid input no
+        // destructive operation is even attempted (a delete-before-validate
+        // order would destroy ready drafts on invalid input).
+        let email = self.compose_update_draft(&params)?;
+        let raw = email.formatted();
 
         let mut conn = self.get_imap_connection().await?;
         let drafts_name = self
@@ -1630,72 +1850,463 @@ impl EmailServer {
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-        // Delete old draft
-        conn.uid_store(&params.uid.to_string(), "+FLAGS (\\Deleted)")
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?
-            .try_collect::<Vec<_>>()
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        conn.expunge()
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?
-            .try_collect::<Vec<_>>()
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        // 2. APPEND first — completely non-destructive. On a definite failure
+        // or on an UNCERTAIN outcome the old draft stays untouched, and there
+        // is NO blind retry. The append runs on a DEDICATED connection (never
+        // returned to the pool): if it is left waiting for a literal or in an
+        // uncertain protocol state it is simply discarded on drop, instead of
+        // going back to the pool as "valid".
+        let mut append_session = self.dedicated_imap_session().await?;
+        let appended = append_new_draft(
+            &mut append_session,
+            &drafts_name,
+            &raw,
+            self.imap_operation_timeout(),
+        )
+        .await?;
+        // La connessione dedicata non serve piu': viene chiusa e scartata,
+        // qualunque sia lo stato di protocollo raggiunto.
+        drop(append_session);
+        let new_uid_text = appended
+            .new_uid
+            .map(|u| u.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
 
-        // Create new draft
-        use lettre::Message;
-        use lettre::message::{MultiPart, SinglePart, header::ContentType};
-
-        let from_addr = self.provider.default_from();
-        let email = Message::builder()
-            .from(
-                from_addr
-                    .parse()
-                    .map_err(|e| McpError::internal_error(format!("Invalid from: {e}"), None))?,
-            )
-            .to(params
-                .to
-                .parse()
-                .map_err(|e| McpError::internal_error(format!("Invalid to: {e}"), None))?)
-            .subject(&params.subject);
-
-        let email = if params.html.is_some() {
-            email.multipart(
-                MultiPart::alternative()
-                    .singlepart(
-                        SinglePart::builder()
-                            .header(ContentType::TEXT_PLAIN)
-                            .body(params.body.unwrap_or_default()),
-                    )
-                    .singlepart(
-                        SinglePart::builder()
-                            .header(ContentType::TEXT_HTML)
-                            .body(params.html.unwrap_or_default()),
+        // 3. Only after a CONFIRMED append success: remove the old draft,
+        // with a targeted UID EXPUNGE on that single UID only.
+        let has_uidplus = conn
+            .capabilities()
+            .await
+            .map_err(|e| {
+                // The APPEND is ALREADY confirmed here: the error must say
+                // that the new draft is saved and the old one is untouched.
+                McpError::internal_error(
+                    format!(
+                        "new draft APPENDED successfully (uid={new_uid_text}), but the old draft uid={old_uid} was NOT marked or removed: the UIDPLUS capability check failed ({e}); state: BOTH drafts present, no retry",
                     ),
-            )
-        } else {
-            email.singlepart(
-                SinglePart::builder()
-                    .header(ContentType::TEXT_PLAIN)
-                    .body(params.body.unwrap_or_default()),
-            )
-        }
-        .map_err(|e| McpError::internal_error(format!("Failed to build draft: {e}"), None))?;
+                    None,
+                )
+            })?
+            .has_str("UIDPLUS");
 
-        let raw = email.formatted();
-        conn.append(&drafts_name, Default::default(), None, &raw)
+        if !has_uidplus {
+            // Without UIDPLUS there is no safe way to remove only the old
+            // draft: expunge() is GLOBAL and would also destroy any other
+            // message already marked \\Deleted in the folder. The old draft
+            // is preserved and the partial substitution is declared.
+            return Ok(CallToolResult::success(vec![Content::text(format!(
+                "Draft appended: new uid={}. PARTIAL SUBSTITUTION: old draft uid={} preserved (server does not advertise UIDPLUS, so a targeted UID EXPUNGE is impossible and a global EXPUNGE is never used).",
+                new_uid_text, old_uid
+            ))]));
+        }
+
+        conn.uid_store(&old_uid.to_string(), "+FLAGS (\\Deleted)")
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(|e| {
+                McpError::internal_error(
+                    format!(
+                        "new draft APPENDED successfully (uid={}); the old draft uid={} was NOT removed (no expunge attempted) and its \\Deleted mark MAY OR MAY NOT have been applied: {e}; state: new draft safe, no retry",
+                        new_uid_text, old_uid
+                    ),
+                    None,
+                )
+            })?
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|e| {
+                McpError::internal_error(
+                    format!(
+                        "new draft APPENDED successfully (uid={}); the old draft uid={} was NOT removed (no expunge attempted) and its \\Deleted mark MAY OR MAY NOT have been applied: {e}; state: new draft safe, no retry",
+                        new_uid_text, old_uid
+                    ),
+                    None,
+                )
+            })?;
+
+        conn.uid_expunge(old_uid.to_string())
+            .await
+            .map_err(|e| {
+                McpError::internal_error(
+                    format!(
+                        "new draft APPENDED successfully (uid={}); the old draft uid={} removal outcome is UNCERTAIN: the targeted UID EXPUNGE MAY have been applied before its response was lost ({e}); do NOT assume the old draft still exists; no retry",
+                        new_uid_text, old_uid
+                    ),
+                    None,
+                )
+            })?
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|e| {
+                McpError::internal_error(
+                    format!(
+                        "new draft APPENDED successfully (uid={}); the old draft uid={} removal outcome is UNCERTAIN: the targeted UID EXPUNGE MAY have been applied before its response was lost ({e}); do NOT assume the old draft still exists; no retry",
+                        new_uid_text, old_uid
+                    ),
+                    None,
+                )
+            })?;
 
         Ok(CallToolResult::success(vec![Content::text(format!(
-            "Draft uid={} updated",
-            params.uid
+            "Draft updated: new uid={} now holds the content; old uid={} removed via targeted UID EXPUNGE (other drafts untouched).",
+            new_uid_text, old_uid
         ))]))
     }
 
+    // ── Composizione messaggi in uscita (condivisa) ─────────────
+    //
+    // I TRE percorsi di costruzione del corpo (send_email, create_draft,
+    // update_draft) passano tutti da `crate::attachments::compose_body`:
+
+    // mixed esterno con alternative interno quando servono sia html sia
+    // allegati, formati storici (singlepart / alternative) quando no.
+    // I metodi sono PUBBLICI per essere esercitati dai test di composizione:
+    // non fanno NESSUNA I/O di rete (nessun SMTP/IMAP).
+
+    /// Early guard: the textual body and headers must not already exceed the
+    /// MIME ceiling BEFORE composing and serializing the whole message (this
+    /// avoids large allocations just to discover the limit too late).
+    /// The EXACT check on the serialized MIME stays in `finalize_composed`.
+    fn preflight_body_headers(
+        body: &str,
+        html: Option<&str>,
+        subject: &str,
+        to: &str,
+        from: &str,
+        extra_headers: &[&str],
+        max_mime_bytes: u64,
+    ) -> Result<(), McpError> {
+        let mut total = body.len() as u64
+            + html.map(|h| h.len() as u64).unwrap_or(0)
+            + subject.len() as u64
+            + to.len() as u64
+            + from.len() as u64;
+        for h in extra_headers {
+            total += h.len() as u64;
+        }
+        if total > max_mime_bytes {
+            return Err(McpError::internal_error(
+                format!(
+                    "body/headers size {total} already exceeds the MIME limit {max_mime_bytes} (EMAIL_ATTACH_MAX_MIME_BYTES): rejected BEFORE composing (preliminary guard); the exact serialized-size check stays in place"
+                ),
+                None,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Prepara gli allegati richiesti: errore esplicito se `EMAIL_ATTACH_DIR`
+    /// non è configurata (allegati disabilitati, mai fallback a cwd/home).
+    fn prepare_attachments(
+        &self,
+        attachments: Option<&[AttachmentParam]>,
+    ) -> Result<Vec<crate::attachments::PreparedAttachment>, McpError> {
+        let Some(list) = attachments else {
+            return Ok(Vec::new());
+        };
+        if list.is_empty() {
+            // `[]` and omitted must behave the same EVEN without a configured
+            // root: there is no attachment to read, so the EMAIL_ATTACH_DIR
+            // gate does not apply. A non-empty list without a root stays
+            // rejected.
+            return Ok(Vec::new());
+        }
+        let Some(dir) = self.config.attachment_dir.as_ref() else {
+            return Err(McpError::internal_error(
+                "attachments are disabled: EMAIL_ATTACH_DIR is not configured; \
+                 set it to a dedicated directory to enable outgoing attachments \
+                 (no fallback to cwd or home)",
+                None,
+            ));
+        };
+        let inputs = list.iter().map(|a| crate::attachments::AttachmentInput {
+            path: &a.path,
+            filename: a.filename.as_deref(),
+            mime: a.mime.as_deref(),
+        });
+        crate::attachments::prepare(
+            dir,
+            inputs,
+            crate::attachments::AttachmentLimits {
+                max_mime_bytes: self.config.attachment_max_mime_bytes,
+                max_count: self.config.attachment_max_count,
+            },
+        )
+        .map_err(|e| McpError::internal_error(e.to_string(), None))
+    }
+
+    /// Finalizza il Message e applica il tetto ESATTO sul MIME serializzato
+    /// (header e transfer encoding inclusi).
+    fn finalize_composed(
+        builder: lettre::message::MessageBuilder,
+        composed: crate::attachments::ComposedBody,
+        max_mime_bytes: u64,
+    ) -> Result<lettre::Message, McpError> {
+        let built = match composed {
+            crate::attachments::ComposedBody::Single(part) => builder.singlepart(part),
+            crate::attachments::ComposedBody::Multi(parts) => builder.multipart(parts),
+        }
+        .map_err(|e| McpError::internal_error(format!("Failed to build email: {e}"), None))?;
+        let raw_len = built.formatted().len() as u64;
+        if raw_len > max_mime_bytes {
+            return Err(McpError::internal_error(
+                format!(
+                    "serialized MIME size {raw_len} exceeds attachment limit {max_mime_bytes} \
+                     (EMAIL_ATTACH_MAX_MIME_BYTES)"
+                ),
+                None,
+            ));
+        }
+        Ok(built)
+    }
+
+    /// Corpo+headers di `send_email` SENZA rete: usato dall'handler e dai test.
+    pub fn compose_send_email(
+        &self,
+        params: &SendEmailParams,
+    ) -> Result<lettre::Message, McpError> {
+        Self::validate_from_override(
+            params.from.as_deref(),
+            self.provider.default_from(),
+            self.provider.allowed_from(),
+        )?;
+        let from_addr: &str = params
+            .from
+            .as_deref()
+            .unwrap_or_else(|| self.provider.default_from());
+        // The preflight comes BEFORE the builder and the parses: the headers
+        // are still un-cloned strings here — it is exactly that allocation
+        // (clones and builder) that the guard avoids.
+        Self::preflight_body_headers(
+            params.body.as_deref().unwrap_or(""),
+            params.html.as_deref(),
+            &params.subject,
+            &params.to,
+            from_addr,
+            &[
+                params.cc.as_deref().unwrap_or(""),
+                params.bcc.as_deref().unwrap_or(""),
+                params.reply_to.as_deref().unwrap_or(""),
+                params.in_reply_to.as_deref().unwrap_or(""),
+                params.references.as_deref().unwrap_or(""),
+            ],
+            self.config.attachment_max_mime_bytes,
+        )?;
+        // `to`, `cc` and `bcc` accept comma/semicolon separated lists;
+        // the whole list is validated (field + 1-based entry index in the
+        // error) before the builder, the attachments and any I/O.
+        let recipients = crate::recipients::parse_recipients(
+            &params.to,
+            params.cc.as_deref(),
+            params.bcc.as_deref(),
+        )?;
+        // The Bcc recipients ride the SMTP ENVELOPE only: lettre derives
+        // the envelope from the To+Cc+Bcc headers at build time and its
+        // default `drop_bcc` then removes the Bcc header from the
+        // serialized message (RFC 5322 §3.6.3) — verified by the fake
+        // SMTP test: RCPT TO carries to+cc+bcc, DATA has no Bcc header.
+        let mut builder = crate::recipients::apply_recipients(
+            lettre::Message::builder()
+                .from(
+                    from_addr
+                        .parse()
+                        .map_err(|e| McpError::internal_error(format!("Invalid from: {e}"), None))?,
+                )
+                .subject(&params.subject),
+            recipients,
+        );
+        if let Some(ref reply_to) = params.reply_to {
+            builder =
+                builder.reply_to(reply_to.parse().map_err(|e| {
+                    McpError::internal_error(format!("Invalid reply_to: {e}"), None)
+                })?);
+        }
+        // Threading headers
+        if let Some(ref irt) = params.in_reply_to {
+            builder = builder.in_reply_to(irt.clone());
+        }
+        if let Some(ref refs) = params.references {
+            builder = builder.references(refs.clone());
+        }
+        let prepared = self.prepare_attachments(params.attachments.as_deref())?;
+        let composed = crate::attachments::compose_body(
+            params.body.clone().unwrap_or_default(),
+            params.html.clone(),
+            &prepared,
+        );
+        Self::finalize_composed(builder, composed, self.config.attachment_max_mime_bytes)
+    }
+
+    /// Corpo+headers di `create_draft` SENZA rete.
+    pub fn compose_create_draft(
+        &self,
+        params: &CreateDraftParams,
+    ) -> Result<lettre::Message, McpError> {
+        let from_addr = self.provider.default_from();
+        // Preflight BEFORE the builder and the parses — cc and bcc included
+        // in the size ceiling.
+        Self::preflight_body_headers(
+            params.body.as_deref().unwrap_or(""),
+            params.html.as_deref(),
+            &params.subject,
+            &params.to,
+            from_addr,
+            &[
+                params.cc.as_deref().unwrap_or(""),
+                params.bcc.as_deref().unwrap_or(""),
+            ],
+            self.config.attachment_max_mime_bytes,
+        )?;
+        // Liste di destinatari (to/cc/bcc), validate per intero
+        // (campo + indice) prima di builder, allegati e APPEND.
+        let recipients = crate::recipients::parse_recipients(
+            &params.to,
+            params.cc.as_deref(),
+            params.bcc.as_deref(),
+        )?;
+        // The draft is PRIVATE to the account, so Bcc is KEPT in the
+        // stored headers (`keep_bcc`: lettre's default would drop it at
+        // build time) — the draft stays fully editable. Bcc is stripped
+        // from the message only when SENDING (see compose_send_email).
+        let builder = crate::recipients::apply_recipients(
+            lettre::Message::builder()
+                .from(
+                    from_addr
+                        .parse()
+                        .map_err(|e| McpError::internal_error(format!("Invalid from: {e}"), None))?,
+                )
+                .keep_bcc()
+                .subject(&params.subject),
+            recipients,
+        );
+        let prepared = self.prepare_attachments(params.attachments.as_deref())?;
+        let composed = crate::attachments::compose_body(
+            params.body.clone().unwrap_or_default(),
+            params.html.clone(),
+            &prepared,
+        );
+        Self::finalize_composed(builder, composed, self.config.attachment_max_mime_bytes)
+    }
+
+    /// Corpo+headers di `update_draft` SENZA rete: nessuna conservazione
+    /// implicita degli allegati della bozza precedente (omesso o `[]` =
+    /// bozza senza allegati). Sostituzione COMPLETA anche per cc/bcc:
+    /// omessi = header assenti nella nuova bozza.
+    pub fn compose_update_draft(
+        &self,
+        params: &UpdateDraftParams,
+    ) -> Result<lettre::Message, McpError> {
+        let from_addr = self.provider.default_from();
+        // Preflight BEFORE the builder and the parses — cc and bcc included
+        // in the size ceiling.
+        Self::preflight_body_headers(
+            params.body.as_deref().unwrap_or(""),
+            params.html.as_deref(),
+            &params.subject,
+            &params.to,
+            from_addr,
+            &[
+                params.cc.as_deref().unwrap_or(""),
+                params.bcc.as_deref().unwrap_or(""),
+            ],
+            self.config.attachment_max_mime_bytes,
+        )?;
+        // Liste di destinatari (to/cc/bcc), validate per intero
+        // (campo + indice) prima di builder, allegati, APPEND, STORE ed
+        // EXPUNGE. cc/bcc omessi = campi rimossi (sostituzione completa).
+        let recipients = crate::recipients::parse_recipients(
+            &params.to,
+            params.cc.as_deref(),
+            params.bcc.as_deref(),
+        )?;
+        // come compose_create_draft: bozza privata, Bcc conservato.
+        let builder = crate::recipients::apply_recipients(
+            lettre::Message::builder()
+                .from(
+                    from_addr
+                        .parse()
+                        .map_err(|e| McpError::internal_error(format!("Invalid from: {e}"), None))?,
+                )
+                .keep_bcc()
+                .subject(&params.subject),
+            recipients,
+        );
+        let prepared = self.prepare_attachments(params.attachments.as_deref())?;
+        let composed = crate::attachments::compose_body(
+            params.body.clone().unwrap_or_default(),
+            params.html.clone(),
+            &prepared,
+        );
+        Self::finalize_composed(builder, composed, self.config.attachment_max_mime_bytes)
+    }
+
     // ── Email operations ────────────────────────────────────────
+
+    /// SAFE removal of messages marked \Deleted (without UIDPLUS there is no
+    /// expunge at all).
+    ///
+    /// With UIDPLUS: a targeted UID EXPUNGE on the requested uids only.
+    /// Without UIDPLUS: NO expunge — a global one removes every message
+    /// marked \Deleted, and a prior snapshot of the state (SEARCH DELETED)
+    /// does not close the window in which another client marks others. The
+    /// requested messages stay marked and the response states it.
+    async fn expunge_marked_uids(
+        &self,
+        conn: &mut crate::pool::TlsImapSession,
+        requested: &[u32],
+    ) -> Result<ExpungeOutcome, McpError> {
+        // Every error declares ONLY what is known ("NOT expunged" is true
+        // only while the expunge has never been sent; if the response is
+        // lost, the removal is UNCERTAIN and may have been applied).
+        let has_uidplus = conn
+            .capabilities()
+            .await
+            .map_err(|e| {
+                McpError::internal_error(
+                    format!(
+                        "removal NOT attempted: the UIDPLUS capability check failed ({e}); the requested messages remain marked \\Deleted and NOT expunged; no retry"
+                    ),
+                    None,
+                )
+            })?
+            .has_str("UIDPLUS");
+
+        if has_uidplus {
+            let uid_set = requested
+                .iter()
+                .map(|u| u.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            conn.uid_expunge(uid_set)
+                .await
+                .map_err(|e| {
+                    McpError::internal_error(
+                        format!(
+                            "removal outcome UNCERTAIN: the UID EXPUNGE command failed while being sent ({e}); it may or may not have been applied; do NOT assume the messages still exist, nor that they are still merely marked \\Deleted; no retry"
+                        ),
+                        None,
+                    )
+                })?
+                .try_collect::<Vec<_>>()
+                .await
+                .map_err(|e| {
+                    McpError::internal_error(
+                        format!(
+                            "removal outcome UNCERTAIN: the UID EXPUNGE may have been applied before its response was lost ({e}); do NOT assume the marked messages still exist; no retry"
+                        ),
+                        None,
+                    )
+                })?;
+            return Ok(ExpungeOutcome::Targeted);
+        }
+
+        // Without UIDPLUS there is no expunge. Not even when a SEARCH
+        // DELETED snapshot showed a matching set: between SEARCH and
+        // EXPUNGE another client can mark other messages, and the global
+        // expunge would take those away too. The requested marking stays
+        // and the response declares the deferred removal.
+        let _ = requested;
+        Ok(ExpungeOutcome::DeferredMarkedOnly)
+    }
 
     #[tool(description = "Delete an email by UID")]
     async fn delete_email(
@@ -1718,17 +2329,18 @@ impl EmailServer {
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-        conn.expunge()
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?
-            .try_collect::<Vec<_>>()
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "Email uid={} deleted",
-            params.uid
-        ))]))
+        match self.expunge_marked_uids(&mut conn, &[params.uid]).await? {
+            ExpungeOutcome::Targeted => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Email uid={} deleted (targeted UID EXPUNGE; other \\Deleted messages untouched)",
+                params.uid
+            ))])),
+            ExpungeOutcome::DeferredMarkedOnly => Ok(CallToolResult::success(vec![Content::text(
+                format!(
+                    "Email uid={} marked \\Deleted but NOT expunged: the server does not advertise UIDPLUS, so a targeted removal is unavailable and a global EXPUNGE is never used (it would also remove \\Deleted messages from other clients). The mark remains; the message will disappear when the folder is next expunged.",
+                    params.uid
+                ),
+            )])),
+        }
     }
 
     #[tool(description = "Move an email between folders")]
@@ -1923,17 +2535,17 @@ impl EmailServer {
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-        conn.expunge()
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?
-            .try_collect::<Vec<_>>()
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "Deleted {} emails",
-            params.uids.len()
-        ))]))
+        match self.expunge_marked_uids(&mut conn, &params.uids).await? {
+            ExpungeOutcome::Targeted => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Deleted {} emails (targeted UID EXPUNGE of uid set {uid_set}; other \\Deleted messages untouched)",
+                params.uids.len()
+            ))])),
+            ExpungeOutcome::DeferredMarkedOnly => Ok(CallToolResult::success(vec![Content::text(
+                format!(
+                    "Deleted 0 emails: {uid_set} marked \\Deleted but NOT expunged — the server does not advertise UIDPLUS, so a targeted removal is unavailable and a global EXPUNGE is never used (it would also remove \\Deleted messages from other clients). The marks remain; the messages will disappear when the folder is next expunged.",
+                ),
+            )])),
+        }
     }
 
     #[tool(description = "Download an email attachment as base64 or save it to disk")]
@@ -2298,6 +2910,9 @@ impl EmailServer {
             "SMTP_PASSWORD":              env_status("SMTP_PASSWORD"),
             "SMTP_STARTTLS":              env_status("SMTP_STARTTLS"),
             "SMTP_FROM_ADDRESS":          env_status("SMTP_FROM_ADDRESS"),
+            "EMAIL_ATTACH_DIR":           env_status("EMAIL_ATTACH_DIR"),
+            "EMAIL_ATTACH_MAX_MIME_BYTES": env_status("EMAIL_ATTACH_MAX_MIME_BYTES"),
+            "EMAIL_ATTACH_MAX_COUNT":     env_status("EMAIL_ATTACH_MAX_COUNT"),
         });
 
         // Source/precedence: any email env key counts toward "env". TOML
@@ -2327,6 +2942,9 @@ impl EmailServer {
             "SMTP_PASSWORD",
             "SMTP_STARTTLS",
             "SMTP_FROM_ADDRESS",
+            "EMAIL_ATTACH_DIR",
+            "EMAIL_ATTACH_MAX_MIME_BYTES",
+            "EMAIL_ATTACH_MAX_COUNT",
         ]
         .iter()
         .any(|k| std::env::var(k).is_ok());
@@ -2404,6 +3022,67 @@ impl EmailServer {
             .get()
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))
+    }
+
+    /// A DEDICATED IMAP connection: it does not go through the pool and is
+    /// NEVER returned to it — on drop it is simply closed. Used for the
+    /// draft APPEND, which can leave the session waiting for a literal (a
+    /// non-reusable protocol state).
+    async fn dedicated_imap_session(
+        &self,
+    ) -> Result<crate::pool::TlsImapSession, McpError> {
+        let auth = match self.config.imap_auth {
+            crate::config::AuthMechanism::Plain | crate::config::AuthMechanism::Auto => {
+                crate::pool::AuthMethod::Plain {
+                    password: self.config.imap_password.clone(),
+                }
+            }
+            crate::config::AuthMechanism::Login => crate::pool::AuthMethod::Login {
+                password: self.config.imap_password.clone(),
+            },
+            crate::config::AuthMechanism::XOAuth2 => {
+                let token = self.config.imap_xoauth2_token.clone().ok_or_else(|| {
+                    McpError::internal_error("IMAP_XOAUTH2_TOKEN required", None)
+                })?;
+                crate::pool::AuthMethod::XOAuth2 {
+                    user: self.config.imap_user.clone(),
+                    access_token: token,
+                }
+            }
+            crate::config::AuthMechanism::CramMd5 => crate::pool::AuthMethod::CramMd5 {
+                password: self.config.imap_password.clone(),
+            },
+        };
+        let manager = crate::pool::ImapConnectionManager::new(
+            self.config.imap_host.clone(),
+            self.config.imap_port,
+            self.config.imap_user.clone(),
+            auth,
+            self.config.imap_tls_reject_unauthorized,
+            std::time::Duration::from_secs(self.config.operation_timeout_secs),
+        );
+        use bb8::ManageConnection as _;
+        // The TLS handshake and the login have no internal timeout in the
+        // manager (pool.rs only bounds the TCP connect): a peer that accepts
+        // and then goes silent would hang without a limit. An outer deadline
+        // with the same truthful message as the other branches.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(self.config.operation_timeout_secs),
+            manager.connect(),
+        )
+        .await
+        .map_err(|_| {
+            McpError::internal_error(
+                "draft APPEND abandoned: the dedicated connection timed out during TLS handshake or login; nothing was transferred and the old draft is intact; the connection was discarded",
+                None,
+            )
+        })?
+        .map_err(|e| {
+            McpError::internal_error(
+                format!("dedicated connection for the draft APPEND failed (old draft intact): {e}"),
+                None,
+            )
+        })
     }
 
     /// Get or lazily create the cached SMTP transport
@@ -2484,6 +3163,41 @@ impl ServerHandler for EmailServer {
     }
 }
 
+/// Controlled description of an SMTP send failure: severity and numeric
+/// reply code only (`smtp transient 450`, `smtp permanent 550`, ...).
+///
+/// The raw server text is deliberately dropped: an SMTP refusal often
+/// quotes the recipient address it is refusing — and a Bcc recipient is
+/// envelope-only, so its address must never surface in a client error or
+/// a log line. Public so the confidentiality tests exercise the exact
+/// function used by the send path.
+pub fn classify_smtp_send_failure(e: &lettre::transport::smtp::Error) -> String {
+    let severity = if e.is_transient() {
+        "transient"
+    } else if e.is_permanent() {
+        "permanent"
+    } else {
+        return if e.is_timeout() {
+            "smtp timeout"
+        } else if e.is_tls() {
+            "smtp tls error"
+        } else if e.is_transport_shutdown() {
+            "smtp transport shutdown"
+        } else if e.is_response() {
+            "smtp response error"
+        } else if e.is_client() {
+            "smtp client error"
+        } else {
+            "smtp connection error"
+        }
+        .to_string();
+    };
+    match e.status() {
+        Some(code) => format!("smtp {severity} {code}"),
+        None => format!("smtp {severity}"),
+    }
+}
+
 #[cfg(test)]
 mod contract_tests {
     use super::*;
@@ -2512,6 +3226,9 @@ mod contract_tests {
             pool_max_connections: 1,
             pool_idle_timeout_secs: 30,
             operation_timeout_secs: 30,
+            attachment_dir: None,
+            attachment_max_mime_bytes: crate::attachments::DEFAULT_MAX_MIME_BYTES,
+            attachment_max_count: crate::attachments::DEFAULT_MAX_COUNT,
         }
     }
 
@@ -2690,6 +3407,33 @@ mod contract_tests {
             msg.contains("not in smtp.allowed_from"),
             "error message should mention allowed_from; got: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn attachment_params_exposed_in_tool_schemas() {
+        let server = EmailServer::from_config(test_config()).expect("server should construct");
+        for name in ["send_email", "create_draft", "update_draft"] {
+            let tool = server
+                .tool_router
+                .list_all()
+                .into_iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("{name} tool must exist"));
+            let schema = Value::Object((*tool.input_schema).clone());
+            let properties = schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .unwrap_or_else(|| panic!("{name} schema must have properties"));
+            assert!(
+                properties.contains_key("attachments"),
+                "{name} must expose `attachments`: {schema}"
+            );
+            // Inline schema: no $defs allowed (portability contract).
+            assert!(
+                !schema.to_string().contains("$defs"),
+                "{name} schema must inline the attachment shape: {schema}"
+            );
+        }
     }
 
     #[tokio::test]

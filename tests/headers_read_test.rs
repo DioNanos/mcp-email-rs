@@ -9,8 +9,8 @@
 //! headers. The accessor that matches what the tool ASKS for is
 //! `fetch.header()` (async-imap `types/fetch.rs:90`).
 //!
-//! Scope note: the \Seen side effect of non-PEEK fetches is D-112 and
-//! lives on its own branch; this fake does not model it.
+//! Scope note: the \Seen side effect of non-PEEK fetches is not modeled
+//! by this fake.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};

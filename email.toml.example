@@ -8,6 +8,10 @@ user = "you@example.com"
 password = "your-app-password"
 tls = true
 tls_reject_unauthorized = true
+# Setting this to false DISABLES TLS certificate verification: every
+# connection then logs a prominent WARNING on stderr and is vulnerable
+# to man-in-the-middle attacks. Keep true unless you know you need it
+# (self-signed IMAP server on a trusted network).
 auth = "plain"
 # xoauth2_token = ""  # Only needed when auth = "xoauth2"
 
@@ -41,3 +45,31 @@ auth = "plain"
 # idle_timeout_secs = 300
 # Per-operation IMAP timeout in seconds; values are clamped to 1..=300.
 # operation_timeout_secs = 30
+
+# ── Outgoing attachments ─────────────────────────────────────────────
+# Attachment staging is configured ONLY via environment variables; there
+# are no [attachments] TOML keys (kept env-only on purpose so operators
+# cannot point two server instances at one shared staging by copying a
+# config file around). Set these in the server environment:
+#
+#   EMAIL_ATTACH_DIR              — dedicated staging dir; UNSET = the
+#                                   attachments parameter is DISABLED in
+#                                   send_email / create_draft /
+#                                   update_draft (explicit error; no
+#                                   fallback to cwd or home)
+#   EMAIL_ATTACH_MAX_MIME_BYTES   — default 25000000; cap measured on the
+#                                   SERIALIZED MIME of the whole message
+#                                   (headers + transfer encoding, so
+#                                   base64 inflation counts)
+#   EMAIL_ATTACH_MAX_COUNT        — default 50 attachments per message
+#
+# OPERATIONAL CONTRACT: EMAIL_ATTACH_DIR must be a dedicated, admin-managed,
+# TRUSTED staging directory, separate from EMAIL_DOWNLOAD_DIR, populated only
+# with files the caller is authorized to send. Requests are confined beneath
+# the root (openat2, relative paths only, symlinks rejected), but that does
+# NOT protect against: a sensitive file already placed inside the staging
+# (readable by anyone who can drive this server), hardlinks / bind mounts /
+# concurrent writers on the same inode (symlink rejection does not cover
+# them), or an operator-level replacement of the root itself (the root is
+# re-opened per file, not pinned at startup). Do not point it at a directory
+# containing anything the caller must not send.

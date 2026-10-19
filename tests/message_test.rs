@@ -280,6 +280,9 @@ mod config_tests {
             pool_max_connections: 4,
             pool_idle_timeout_secs: 300,
             operation_timeout_secs: 30,
+            attachment_dir: None,
+            attachment_max_mime_bytes: mcp_email_rs::attachments::DEFAULT_MAX_MIME_BYTES,
+            attachment_max_count: mcp_email_rs::attachments::DEFAULT_MAX_COUNT,
         };
         assert!(config.validate().is_err());
     }
@@ -306,6 +309,9 @@ mod config_tests {
             pool_max_connections: 4,
             pool_idle_timeout_secs: 300,
             operation_timeout_secs: 30,
+            attachment_dir: None,
+            attachment_max_mime_bytes: mcp_email_rs::attachments::DEFAULT_MAX_MIME_BYTES,
+            attachment_max_count: mcp_email_rs::attachments::DEFAULT_MAX_COUNT,
         };
         assert!(config.validate().is_ok());
     }

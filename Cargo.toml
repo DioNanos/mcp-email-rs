@@ -1,6 +1,6 @@
 [package]
 name = "mcp-email-rs"
-version = "0.3.3"
+version = "0.3.5"
 edition = "2024"
 license = "MIT"
 description = "Enterprise-grade Rust MCP email server with full IMAP support"
@@ -56,6 +56,10 @@ async-trait = "0.1"
 
 # Base64 for attachments
 base64 = "0.22"
+
+# openat2(2) guard for outgoing attachment staging (RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS).
+# Same 0.2.x version already resolved in Cargo.lock: no new crate.
+libc = "0.2"
 
 # Chrono for dates
 chrono = "0.4"

@@ -10,6 +10,8 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   BIN: mcp-email-rs
+  # Keep builder paths (home, cargo registry, rustup, workspace) out of the binaries.
+  RUSTFLAGS: "--remap-path-prefix=/home/runner=/build --remap-path-prefix=/cargo=/build/cargo --remap-path-prefix=/rust=/build/rust --remap-path-prefix=/project=/build/src"
 
 jobs:
   # Linux x86_64 + arm64 (gnu/musl). macOS ships no prebuilt binary —
@@ -125,3 +127,5 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
+          # Assets are reviewed before the release is made public.
+          draft: true

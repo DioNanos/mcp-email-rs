@@ -28,6 +28,11 @@ fn build_tls_config(verify: bool) -> Arc<rustls::ClientConfig> {
         .with_no_client_auth();
 
     if !verify {
+        // An insecure connection must never be silent. This runs for every
+        // connection created with verification disabled.
+        eprintln!(
+            "WARNING: TLS certificate verification DISABLED (tls_reject_unauthorized=false): this connection is vulnerable to man-in-the-middle attacks"
+        );
         // Danger: skip certificate verification (for self-signed servers)
         let mut dangerous = config;
         dangerous

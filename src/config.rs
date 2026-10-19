@@ -1,5 +1,6 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use crate::attachments::{DEFAULT_MAX_COUNT, DEFAULT_MAX_MIME_BYTES};
 use crate::error::EmailError;
 
 /// Lower bound for the configured timeout of one IMAP operation.
@@ -163,6 +164,20 @@ pub struct EmailConfig {
     /// `EMAIL_OPERATION_TIMEOUT` or `[pool].operation_timeout_secs` are
     /// clamped to [`MIN_OPERATION_TIMEOUT_SECS`..=`MAX_OPERATION_TIMEOUT_SECS`].
     pub operation_timeout_secs: u64,
+
+    // Outgoing attachments staging
+    /// Radice dedicata per i file da allegare (`EMAIL_ATTACH_DIR`).
+    /// `None` ⇒ allegati in uscita DISABILITATI con errore esplicito: mai
+    /// fallback a cwd o home (la staging degli allegati non è la cartella
+    /// dei download `EMAIL_DOWNLOAD_DIR`).
+    pub attachment_dir: Option<PathBuf>,
+    /// Tetto sul MIME serializzato dell'intero messaggio con allegati, in byte
+    /// (`EMAIL_ATTACH_MAX_MIME_BYTES`, default [`DEFAULT_MAX_MIME_BYTES`]):
+    /// header e transfer encoding inclusi, non la somma dei file grezzi.
+    pub attachment_max_mime_bytes: u64,
+    /// Numero massimo di allegati per messaggio
+    /// (`EMAIL_ATTACH_MAX_COUNT`, default [`DEFAULT_MAX_COUNT`]).
+    pub attachment_max_count: usize,
 }
 
 impl EmailConfig {
@@ -360,6 +375,27 @@ impl EmailConfig {
             .unwrap_or(30)
             .clamp(MIN_OPERATION_TIMEOUT_SECS, MAX_OPERATION_TIMEOUT_SECS);
 
+        // Outgoing attachments staging: dedicated env, no fallback.
+        let attachment_dir = std::env::var("EMAIL_ATTACH_DIR")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
+        let attachment_max_mime_bytes = std::env::var("EMAIL_ATTACH_MAX_MIME_BYTES")
+            .ok()
+            .map(|v| v.parse::<u64>())
+            .transpose()
+            .map_err(|_| {
+                EmailError::Config("EMAIL_ATTACH_MAX_MIME_BYTES non è un numero valido".into())
+            })?
+            .unwrap_or(DEFAULT_MAX_MIME_BYTES);
+        let attachment_max_count = std::env::var("EMAIL_ATTACH_MAX_COUNT")
+            .ok()
+            .map(|v| v.parse::<usize>())
+            .transpose()
+            .map_err(|_| EmailError::Config("EMAIL_ATTACH_MAX_COUNT non è un numero valido".into()))?
+            .unwrap_or(DEFAULT_MAX_COUNT);
+
         Ok(Self {
             imap_host,
             imap_port,
@@ -377,6 +413,9 @@ impl EmailConfig {
             smtp_from_address,
             smtp_save_sent,
             smtp_allowed_from,
+            attachment_dir,
+            attachment_max_mime_bytes,
+            attachment_max_count,
             pool_max_connections,
             pool_idle_timeout_secs,
             operation_timeout_secs,

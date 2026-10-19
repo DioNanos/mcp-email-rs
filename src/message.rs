@@ -35,6 +35,9 @@ pub struct EmailDetail {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AttachmentInfo {
+    /// Sequential 1-based attachment index: the value download_attachment
+    /// resolves. This is the contract between get_bodystructure and
+    /// download_attachment.
     pub part_id: String,
     pub filename: Option<String>,
     pub content_type: String,

@@ -51,7 +51,7 @@ platform, verifies its checksum, and installs atomically to `~/.local/bin`:
 curl -fsSLO https://raw.githubusercontent.com/DioNanos/mcp-email-rs/main/install.sh
 less install.sh   # always read scripts before running them
 bash install.sh            # latest release
-bash install.sh --version v0.3.3   # or pin a version
+bash install.sh --version v0.3.5   # or pin a version
 ```
 
 
@@ -145,6 +145,12 @@ tool for a safe, machine-readable diagnostic of your configuration.
 | **Organize** | `move_email`, `move_thread`, `copy_email`, `delete_email`, `batch_delete`, `flag_email`, `mark_seen`, `batch_mark_seen` |
 | **Drafts & send** | `create_draft`, `update_draft`, `list_drafts`, `send_email` |
 | **Ops** | `get_quota`, `email_doctor`, `idle_wait` |
+
+`send_email`, `create_draft` and `update_draft` accept a single address or a
+comma/semicolon separated list in `to`, `cc` and `bcc`, and local file
+attachments through the `attachments` parameter (read from a dedicated
+staging directory). Bcc recipients are delivered through the SMTP envelope
+only and never appear in the sent message.
 
 Read tools carry a `readOnlyHint`; mutations and `send_email` are intended to
 pass through your client's approval gate.
