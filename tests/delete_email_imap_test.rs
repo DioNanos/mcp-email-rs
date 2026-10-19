@@ -68,7 +68,10 @@ impl MailboxState {
         Self {
             messages: uids
                 .iter()
-                .map(|u| FakeMsg { uid: *u, deleted: false })
+                .map(|u| FakeMsg {
+                    uid: *u,
+                    deleted: false,
+                })
                 .collect(),
             uidnext: uids.iter().max().copied().unwrap_or(0) + 1,
         }
@@ -486,7 +489,11 @@ fn expunge_any(commands: &[String]) -> Vec<String> {
 #[tokio::test]
 async fn delete_uidplus_targets_only_requested_uid() {
     let (commands, responses, state) = run_scenario(
-        FakeConfig { uidplus: true, caps_fail: false, uid_expunge_loses_ack: false },
+        FakeConfig {
+            uidplus: true,
+            caps_fail: false,
+            uid_expunge_loses_ack: false,
+        },
         MailboxState::normal(&[1]).with_stale_deleted(2),
         &[("delete_email", r#"{"uid":1}"#)],
     )
@@ -522,7 +529,11 @@ async fn delete_uidplus_targets_only_requested_uid() {
 #[tokio::test]
 async fn delete_no_uidplus_other_marked_no_expunge() {
     let (commands, responses, state) = run_scenario(
-        FakeConfig { uidplus: false, caps_fail: false, uid_expunge_loses_ack: false },
+        FakeConfig {
+            uidplus: false,
+            caps_fail: false,
+            uid_expunge_loses_ack: false,
+        },
         MailboxState::normal(&[1]).with_stale_deleted(2),
         &[("delete_email", r#"{"uid":1}"#)],
     )
@@ -561,7 +572,11 @@ async fn delete_no_uidplus_other_marked_no_expunge() {
 #[tokio::test]
 async fn delete_no_uidplus_only_marked_still_deferred() {
     let (commands, responses, state) = run_scenario(
-        FakeConfig { uidplus: false, caps_fail: false, uid_expunge_loses_ack: false },
+        FakeConfig {
+            uidplus: false,
+            caps_fail: false,
+            uid_expunge_loses_ack: false,
+        },
         MailboxState::normal(&[1]),
         &[("delete_email", r#"{"uid":1}"#)],
     )
@@ -594,7 +609,11 @@ async fn delete_no_uidplus_only_marked_still_deferred() {
 #[tokio::test]
 async fn batch_uidplus_targets_only_requested_set() {
     let (commands, responses, state) = run_scenario(
-        FakeConfig { uidplus: true, caps_fail: false, uid_expunge_loses_ack: false },
+        FakeConfig {
+            uidplus: true,
+            caps_fail: false,
+            uid_expunge_loses_ack: false,
+        },
         MailboxState::normal(&[1, 2]).with_stale_deleted(3),
         &[("batch_delete", r#"{"uids":[1,2]}"#)],
     )
@@ -618,7 +637,10 @@ async fn batch_uidplus_targets_only_requested_set() {
         bare_expunge_commands(&commands)
     );
     let st = state.lock().unwrap();
-    assert!(!st.exists(1) && !st.exists(2), "uid 1 e 2 devono essere rimossi");
+    assert!(
+        !st.exists(1) && !st.exists(2),
+        "uid 1 e 2 devono essere rimossi"
+    );
     assert!(
         st.exists(3),
         "la mail gia' marcata \\Deleted (uid=3) DEVE restare intatta"
@@ -630,7 +652,11 @@ async fn batch_uidplus_targets_only_requested_set() {
 #[tokio::test]
 async fn batch_no_uidplus_other_marked_deferred() {
     let (commands, responses, state) = run_scenario(
-        FakeConfig { uidplus: false, caps_fail: false, uid_expunge_loses_ack: false },
+        FakeConfig {
+            uidplus: false,
+            caps_fail: false,
+            uid_expunge_loses_ack: false,
+        },
         MailboxState::normal(&[1, 2]).with_stale_deleted(3),
         &[("batch_delete", r#"{"uids":[1,2]}"#)],
     )
@@ -659,14 +685,21 @@ async fn batch_no_uidplus_other_marked_deferred() {
         st.exists(2) && st.is_deleted(2),
         "uid=2 deve restare presente e marcato"
     );
-    assert!(st.exists(3), "l'altra mail marcata (uid=3) deve essere ancora li'");
+    assert!(
+        st.exists(3),
+        "l'altra mail marcata (uid=3) deve essere ancora li'"
+    );
 }
 
 /// Senza UIDPLUS, batch R1: non si espunge mai, nemmeno senza altri marcati.
 #[tokio::test]
 async fn batch_no_uidplus_only_marked_still_deferred() {
     let (commands, responses, state) = run_scenario(
-        FakeConfig { uidplus: false, caps_fail: false, uid_expunge_loses_ack: false },
+        FakeConfig {
+            uidplus: false,
+            caps_fail: false,
+            uid_expunge_loses_ack: false,
+        },
         MailboxState::normal(&[1, 2]),
         &[("batch_delete", r#"{"uids":[1,2]}"#)],
     )
@@ -687,14 +720,8 @@ async fn batch_no_uidplus_only_marked_still_deferred() {
         "senza UIDPLUS nessun expunge di alcun tipo, NEANCHE per un set unico marcato: {commands:?}"
     );
     let st = state.lock().unwrap();
-    assert!(
-        st.exists(1) && st.is_deleted(1),
-        "uid=1 presente e marcato"
-    );
-    assert!(
-        st.exists(2) && st.is_deleted(2),
-        "uid=2 presente e marcato"
-    );
+    assert!(st.exists(1) && st.is_deleted(1), "uid=1 presente e marcato");
+    assert!(st.exists(2) && st.is_deleted(2), "uid=2 presente e marcato");
 }
 
 /// A lost UID EXPUNGE ACK on delete_email => the error declares the removal
@@ -702,7 +729,11 @@ async fn batch_no_uidplus_only_marked_still_deferred() {
 #[tokio::test]
 async fn delete_uid_expunge_ack_lost_reports_uncertain() {
     let (commands, responses, state) = run_scenario(
-        FakeConfig { uidplus: true, caps_fail: false, uid_expunge_loses_ack: true },
+        FakeConfig {
+            uidplus: true,
+            caps_fail: false,
+            uid_expunge_loses_ack: true,
+        },
         MailboxState::normal(&[1]).with_stale_deleted(2),
         &[("delete_email", r#"{"uid":1}"#)],
     )
@@ -737,14 +768,21 @@ async fn delete_uid_expunge_ack_lost_reports_uncertain() {
         !st.exists(1),
         "sul server l'UID EXPUNGE E' stato applicato: uid=1 rimosso"
     );
-    assert!(st.exists(2), "la seconda mail marcata (uid=2) resta intatta");
+    assert!(
+        st.exists(2),
+        "la seconda mail marcata (uid=2) resta intatta"
+    );
 }
 
 /// The same scenario for batch_delete with a set.
 #[tokio::test]
 async fn batch_uid_expunge_ack_lost_reports_uncertain() {
     let (commands, responses, state) = run_scenario(
-        FakeConfig { uidplus: true, caps_fail: false, uid_expunge_loses_ack: true },
+        FakeConfig {
+            uidplus: true,
+            caps_fail: false,
+            uid_expunge_loses_ack: true,
+        },
         MailboxState::normal(&[1, 2]).with_stale_deleted(3),
         &[("batch_delete", r#"{"uids":[1,2]}"#)],
     )
@@ -787,7 +825,11 @@ async fn batch_uid_expunge_ack_lost_reports_uncertain() {
 #[tokio::test]
 async fn delete_capability_fail_reports_removal_not_attempted() {
     let (commands, responses, state) = run_scenario(
-        FakeConfig { uidplus: true, caps_fail: true, uid_expunge_loses_ack: false },
+        FakeConfig {
+            uidplus: true,
+            caps_fail: true,
+            uid_expunge_loses_ack: false,
+        },
         MailboxState::normal(&[1]).with_stale_deleted(2),
         &[("delete_email", r#"{"uid":1}"#)],
     )

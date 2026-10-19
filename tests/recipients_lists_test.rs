@@ -120,7 +120,13 @@ impl FakeSmtp {
         self.capture.lock().unwrap().rcpt_to.lock().unwrap().clone()
     }
     fn mail_from(&self) -> Vec<String> {
-        self.capture.lock().unwrap().mail_from.lock().unwrap().clone()
+        self.capture
+            .lock()
+            .unwrap()
+            .mail_from
+            .lock()
+            .unwrap()
+            .clone()
     }
     fn data(&self) -> Vec<u8> {
         self.capture.lock().unwrap().data.lock().unwrap().clone()
@@ -131,9 +137,7 @@ impl FakeSmtp {
 }
 
 async fn smtp_write(stream: &mut TcpStream, line: &str) {
-    let _ = stream
-        .write_all(format!("{line}\r\n").as_bytes())
-        .await;
+    let _ = stream.write_all(format!("{line}\r\n").as_bytes()).await;
 }
 
 async fn fake_smtp_loop(
@@ -215,13 +219,7 @@ async fn handle_smtp_conn(
                 data.extend_from_slice(&chunk[..n]);
                 if data.ends_with(b"\r\n.\r\n") {
                     data.truncate(data.len() - 5);
-                    capture
-                        .lock()
-                        .unwrap()
-                        .data
-                        .lock()
-                        .unwrap()
-                        .extend(&data);
+                    capture.lock().unwrap().data.lock().unwrap().extend(&data);
                     let _ = wr.write_all(b"250 ok\r\n").await;
                     break;
                 }
@@ -239,7 +237,10 @@ async fn handle_smtp_conn(
 /// `RCPT TO:<addr> PARAM=x` → `addr`.
 fn extract_address(line: &str) -> String {
     let start = line.find('<').map(|i| i + 1).unwrap_or(0);
-    let end = line[start..].find('>').map(|i| start + i).unwrap_or(line.len());
+    let end = line[start..]
+        .find('>')
+        .map(|i| start + i)
+        .unwrap_or(line.len());
     line[start..end].to_string()
 }
 
@@ -261,8 +262,14 @@ impl MailboxState {
     fn with_old_and_stale_deleted() -> Self {
         Self {
             messages: vec![
-                FakeMsg { uid: 1, deleted: false },
-                FakeMsg { uid: 2, deleted: true },
+                FakeMsg {
+                    uid: 1,
+                    deleted: false,
+                },
+                FakeMsg {
+                    uid: 2,
+                    deleted: true,
+                },
             ],
             uidnext: 3,
         }
@@ -328,17 +335,12 @@ async fn fake_imap_loop(
                     continue;
                 }
                 if upper.starts_with("CAPABILITY") {
-                    imap_respond(&mut wr, "* CAPABILITY IMAP4rev1 AUTH=PLAIN UIDPLUS".into())
-                        .await;
+                    imap_respond(&mut wr, "* CAPABILITY IMAP4rev1 AUTH=PLAIN UIDPLUS".into()).await;
                     imap_respond(&mut wr, format!("{tag} OK")).await;
                     continue;
                 }
                 if upper.starts_with("LIST") {
-                    imap_respond(
-                        &mut wr,
-                        "* LIST (\\HasNoChildren) \"/\" \"Drafts\"".into(),
-                    )
-                    .await;
+                    imap_respond(&mut wr, "* LIST (\\HasNoChildren) \"/\" \"Drafts\"".into()).await;
                     imap_respond(&mut wr, format!("{tag} OK")).await;
                     continue;
                 }
@@ -415,7 +417,10 @@ async fn fake_imap_loop(
                     let new_uid = {
                         let mut st = state.lock().unwrap();
                         let new_uid = st.uidnext;
-                        st.messages.push(FakeMsg { uid: new_uid, deleted: false });
+                        st.messages.push(FakeMsg {
+                            uid: new_uid,
+                            deleted: false,
+                        });
                         st.uidnext += 1;
                         new_uid
                     };
@@ -815,14 +820,10 @@ async fn update_draft_raw_keeps_cc_and_bcc_headers() {
 /// bozza (documentato nella descrizione del tool).
 #[tokio::test]
 async fn update_draft_omitted_cc_bcc_remove_the_headers() {
-    let scenario = run_scenario(
-        &[
-            (
-                "update_draft",
-                r#"{"uid":1,"to":"t1@example.test","subject":"senza cc/bcc","body":"corpo"}"#,
-            ),
-        ],
-    )
+    let scenario = run_scenario(&[(
+        "update_draft",
+        r#"{"uid":1,"to":"t1@example.test","subject":"senza cc/bcc","body":"corpo"}"#,
+    )])
     .await;
 
     assert!(
@@ -840,14 +841,10 @@ async fn update_draft_omitted_cc_bcc_remove_the_headers() {
 
 #[tokio::test]
 async fn invalid_second_recipient_update_draft_zero_side_effects() {
-    let scenario = run_scenario(
-        &[
-            (
-                "update_draft",
-                r#"{"uid":1,"to":"ok@example.test, non-e-una-email","subject":"x","body":"x"}"#,
-            ),
-        ],
-    )
+    let scenario = run_scenario(&[(
+        "update_draft",
+        r#"{"uid":1,"to":"ok@example.test, non-e-una-email","subject":"x","body":"x"}"#,
+    )])
     .await;
 
     assert!(
@@ -862,7 +859,10 @@ async fn invalid_second_recipient_update_draft_zero_side_effects() {
     );
     let st = scenario.state.lock().unwrap();
     assert!(st.exists(1), "il vecchio draft uid=1 deve esistere ancora");
-    assert!(!st.is_deleted(1), "il vecchio draft non deve essere marcato");
+    assert!(
+        !st.is_deleted(1),
+        "il vecchio draft non deve essere marcato"
+    );
     assert!(
         scenario.appended.is_empty(),
         "nessun literal APPEND con lista invalida"

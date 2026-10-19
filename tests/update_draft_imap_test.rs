@@ -16,8 +16,8 @@
 //! real MCP binary driven via JSON-RPC over stdio).
 
 use std::io::{BufRead, BufReader, Write};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -72,8 +72,14 @@ impl MailboxState {
     fn with_old_and_stale_deleted() -> Self {
         Self {
             messages: vec![
-                FakeMsg { uid: 1, deleted: false },
-                FakeMsg { uid: 2, deleted: true },
+                FakeMsg {
+                    uid: 1,
+                    deleted: false,
+                },
+                FakeMsg {
+                    uid: 2,
+                    deleted: true,
+                },
             ],
             uidnext: 3,
         }
@@ -194,8 +200,6 @@ async fn fake_imap_loop(
                 let rest = parts.next().unwrap_or("");
                 let upper = format!("{cmd} {rest}").to_uppercase();
                 let toks: Vec<&str> = line.split_whitespace().collect();
-
-
 
                 if upper.starts_with("LOGIN") || upper.starts_with("NOOP") {
                     respond(&mut wr, ok(&tag)).await;
@@ -339,7 +343,10 @@ async fn fake_imap_loop(
                             }
                             {
                                 let mut st = state.lock().unwrap();
-                                st.messages.push(FakeMsg { uid: new_uid, deleted: false });
+                                st.messages.push(FakeMsg {
+                                    uid: new_uid,
+                                    deleted: false,
+                                });
                                 st.uidnext = st.uidnext.max(new_uid + 1);
                             }
                             if appenduid {
@@ -494,8 +501,7 @@ fn tool_text(response: &serde_json::Value) -> String {
 /// Un errore MCP arriva come oggetto JSON-RPC `error` (McpError dell'handler)
 /// oppure come result con isError=true.
 fn is_error_response(response: &serde_json::Value) -> bool {
-    response.get("error").is_some()
-        || response["result"]["isError"].as_bool() == Some(true)
+    response.get("error").is_some() || response["result"]["isError"].as_bool() == Some(true)
 }
 
 async fn run_scenario(
@@ -606,17 +612,27 @@ fn expunge_commands(commands: &[String]) -> Vec<String> {
 ///    distruttiva. Il vecchio draft e' ancora lì, non e' neanche marcato.
 #[tokio::test]
 async fn invalid_input_keeps_old_draft_untouched() {
-    let (commands, responses, state) =
-        run_scenario(
-            FakeConfig { uidplus: true, append: AppendBehavior::Ok { new_uid: 3, appenduid: true, untagged_first: false }, caps_fail: false, uid_expunge_loses_ack: false, silent_second_connection: false },
-            &[],
-            &[("update_draft", INVALID_CALL)],
-        )
-        .await;
+    let (commands, responses, state) = run_scenario(
+        FakeConfig {
+            uidplus: true,
+            append: AppendBehavior::Ok {
+                new_uid: 3,
+                appenduid: true,
+                untagged_first: false,
+            },
+            caps_fail: false,
+            uid_expunge_loses_ack: false,
+            silent_second_connection: false,
+        },
+        &[],
+        &[("update_draft", INVALID_CALL)],
+    )
+    .await;
 
     assert!(
         is_error_response(&responses[0]),
-        "un input invalido deve produrre un errore: {:?}", responses[0]
+        "un input invalido deve produrre un errore: {:?}",
+        responses[0]
     );
     let destructive = destructive_commands(&commands);
     assert!(
@@ -626,24 +642,33 @@ async fn invalid_input_keeps_old_draft_untouched() {
     );
     let st = state.lock().unwrap();
     assert!(st.exists(1), "il vecchio draft uid=1 deve esistere ancora");
-    assert!(!st.is_deleted(1), "il vecchio draft uid=1 non deve essere marcato \\Deleted");
+    assert!(
+        !st.is_deleted(1),
+        "il vecchio draft uid=1 non deve essere marcato \\Deleted"
+    );
 }
 
 /// 2. APPEND rifiutato dal server: fallimento DEFINITO prima di ogni passo
 ///    distruttivo. Il vecchio draft resta esattamente com'era.
 #[tokio::test]
 async fn append_failure_keeps_old_draft() {
-    let (commands, responses, state) =
-        run_scenario(
-            FakeConfig { uidplus: true, append: AppendBehavior::Reject, caps_fail: false, uid_expunge_loses_ack: false, silent_second_connection: false },
-            &[],
-            &[("update_draft", VALID_CALL)],
-        )
-        .await;
+    let (commands, responses, state) = run_scenario(
+        FakeConfig {
+            uidplus: true,
+            append: AppendBehavior::Reject,
+            caps_fail: false,
+            uid_expunge_loses_ack: false,
+            silent_second_connection: false,
+        },
+        &[],
+        &[("update_draft", VALID_CALL)],
+    )
+    .await;
 
     assert!(
         is_error_response(&responses[0]),
-        "un APPEND rifiutato deve produrre un errore: {:?}", responses[0]
+        "un APPEND rifiutato deve produrre un errore: {:?}",
+        responses[0]
     );
     assert!(
         commands.iter().any(|c| c.to_uppercase().contains("APPEND")),
@@ -651,7 +676,10 @@ async fn append_failure_keeps_old_draft() {
     );
     let st = state.lock().unwrap();
     assert!(st.exists(1), "il vecchio draft uid=1 deve esistere ancora");
-    assert!(!st.is_deleted(1), "il vecchio draft uid=1 non deve essere marcato \\Deleted");
+    assert!(
+        !st.is_deleted(1),
+        "il vecchio draft uid=1 non deve essere marcato \\Deleted"
+    );
     assert!(
         !commands.iter().any(|c| c.to_uppercase().contains("STORE")),
         "nessun UID STORE prima di un APPEND riuscito: {commands:?}"
@@ -666,17 +694,23 @@ async fn append_failure_keeps_old_draft() {
 ///    DICE che l'esito e' incerto, vecchio intatto, NESSUN retry.
 #[tokio::test]
 async fn append_uncertain_keeps_old_draft_no_retry() {
-    let (commands, responses, state) =
-        run_scenario(
-            FakeConfig { uidplus: true, append: AppendBehavior::DropAfterLiteral, caps_fail: false, uid_expunge_loses_ack: false, silent_second_connection: false },
-            &[],
-            &[("update_draft", VALID_CALL)],
-        )
-        .await;
+    let (commands, responses, state) = run_scenario(
+        FakeConfig {
+            uidplus: true,
+            append: AppendBehavior::DropAfterLiteral,
+            caps_fail: false,
+            uid_expunge_loses_ack: false,
+            silent_second_connection: false,
+        },
+        &[],
+        &[("update_draft", VALID_CALL)],
+    )
+    .await;
 
     assert!(
         is_error_response(&responses[0]),
-        "un APPEND con esito incerto deve produrre un errore: {:?}", responses[0]
+        "un APPEND con esito incerto deve produrre un errore: {:?}",
+        responses[0]
     );
     let text = tool_text(&responses[0]).to_uppercase();
     let err_text = responses[0]
@@ -699,7 +733,10 @@ async fn append_uncertain_keeps_old_draft_no_retry() {
     );
     let st = state.lock().unwrap();
     assert!(st.exists(1), "il vecchio draft uid=1 deve esistere ancora");
-    assert!(!st.is_deleted(1), "il vecchio draft uid=1 non deve essere marcato \\Deleted");
+    assert!(
+        !st.is_deleted(1),
+        "il vecchio draft uid=1 non deve essere marcato \\Deleted"
+    );
     assert!(
         expunge_commands(&commands).is_empty(),
         "nessun EXPUNGE dopo un esito incerto: {commands:?}"
@@ -711,18 +748,28 @@ async fn append_uncertain_keeps_old_draft_no_retry() {
 ///    la prova che si e' passati da expunge() globale a UID EXPUNGE.
 #[tokio::test]
 async fn uidplus_success_uid_expunge_targets_only_old_uid() {
-    let (commands, responses, state) =
-        run_scenario(
-            FakeConfig { uidplus: true, append: AppendBehavior::Ok { new_uid: 3, appenduid: true, untagged_first: false }, caps_fail: false, uid_expunge_loses_ack: false, silent_second_connection: false },
-            &[],
-            &[("update_draft", VALID_CALL)],
-        )
-        .await;
+    let (commands, responses, state) = run_scenario(
+        FakeConfig {
+            uidplus: true,
+            append: AppendBehavior::Ok {
+                new_uid: 3,
+                appenduid: true,
+                untagged_first: false,
+            },
+            caps_fail: false,
+            uid_expunge_loses_ack: false,
+            silent_second_connection: false,
+        },
+        &[],
+        &[("update_draft", VALID_CALL)],
+    )
+    .await;
 
     let text = tool_text(&responses[0]);
     assert!(
         !is_error_response(&responses[0]),
-        "lo scenario UIDPLUS valido deve riuscire: {:?}", responses[0]
+        "lo scenario UIDPLUS valido deve riuscire: {:?}",
+        responses[0]
     );
     // Il nuovo UID arriva dall'APPENDUID.
     assert!(
@@ -752,8 +799,14 @@ async fn uidplus_success_uid_expunge_targets_only_old_uid() {
     );
     // STATO: il vecchio e' rimosso, la seconda bozza \Deleted resta.
     let st = state.lock().unwrap();
-    assert!(!st.exists(1), "il vecchio draft uid=1 deve essere stato rimosso");
-    assert!(st.exists(2), "la seconda bozza gia' marcata \\Deleted (uid=2) DEVE restare intatta");
+    assert!(
+        !st.exists(1),
+        "il vecchio draft uid=1 deve essere stato rimosso"
+    );
+    assert!(
+        st.exists(2),
+        "la seconda bozza gia' marcata \\Deleted (uid=2) DEVE restare intatta"
+    );
     assert!(st.exists(3), "la nuova bozza uid=3 deve essere presente");
 }
 
@@ -761,25 +814,37 @@ async fn uidplus_success_uid_expunge_targets_only_old_uid() {
 ///    risposta che dichiara la sostituzione parziale.
 #[tokio::test]
 async fn no_uidplus_partial_substitution_never_global_expunge() {
-    let (commands, responses, state) =
-        run_scenario(
-            FakeConfig { uidplus: false, append: AppendBehavior::Ok { new_uid: 3, appenduid: false, untagged_first: false }, caps_fail: false, uid_expunge_loses_ack: false, silent_second_connection: false },
-            &[],
-            &[("update_draft", VALID_CALL)],
-        )
-        .await;
+    let (commands, responses, state) = run_scenario(
+        FakeConfig {
+            uidplus: false,
+            append: AppendBehavior::Ok {
+                new_uid: 3,
+                appenduid: false,
+                untagged_first: false,
+            },
+            caps_fail: false,
+            uid_expunge_loses_ack: false,
+            silent_second_connection: false,
+        },
+        &[],
+        &[("update_draft", VALID_CALL)],
+    )
+    .await;
 
     let text = tool_text(&responses[0]);
     assert!(
         !is_error_response(&responses[0]),
-        "senza UIDPLUS l'operazione si completa con sostituzione parziale: {:?}", responses[0]
+        "senza UIDPLUS l'operazione si completa con sostituzione parziale: {:?}",
+        responses[0]
     );
     assert!(
         text.to_uppercase().contains("PARTIAL SUBSTITUTION"),
         "la risposta deve dichiarare la sostituzione parziale: {text}"
     );
     assert!(
-        !commands.iter().any(|c| c.to_uppercase().contains("UID EXPUNGE")),
+        !commands
+            .iter()
+            .any(|c| c.to_uppercase().contains("UID EXPUNGE")),
         "senza UIDPLUS nessun UID EXPUNGE: {commands:?}"
     );
     assert!(
@@ -792,8 +857,14 @@ async fn no_uidplus_partial_substitution_never_global_expunge() {
         "senza UIDPLUS il vecchio non va nemmeno marcato \\Deleted (un expunge altrui lo cancellerebbe): {commands:?}"
     );
     let st = state.lock().unwrap();
-    assert!(st.exists(1), "il vecchio draft uid=1 deve essere conservato");
-    assert!(st.exists(2), "la seconda bozza \\Deleted (uid=2) deve restare intatta");
+    assert!(
+        st.exists(1),
+        "il vecchio draft uid=1 deve essere conservato"
+    );
+    assert!(
+        st.exists(2),
+        "la seconda bozza \\Deleted (uid=2) deve restare intatta"
+    );
     assert!(st.exists(3), "la nuova bozza uid=3 deve essere presente");
 }
 
@@ -922,7 +993,10 @@ async fn capability_failure_after_append_reports_conservative() {
         "l'errore deve dire che il vecchio non e' stato toccato: {combined}"
     );
     let st = state.lock().unwrap();
-    assert!(st.exists(1), "il vecchio draft uid=1 deve essere ancora li'");
+    assert!(
+        st.exists(1),
+        "il vecchio draft uid=1 deve essere ancora li'"
+    );
     assert!(st.exists(3), "la nuova bozza uid=3 deve essere salvata");
 }
 
@@ -981,9 +1055,7 @@ async fn uid_expunge_ack_lost_reports_uncertain() {
 #[tokio::test]
 async fn update_draft_body_over_preliminary_limit_rejected_before_composing() {
     let big_body = "x".repeat(200);
-    let call = format!(
-        r#"{{"uid":1,"to":"dest@example.com","subject":"s","body":"{big_body}"}}"#
-    );
+    let call = format!(r#"{{"uid":1,"to":"dest@example.com","subject":"s","body":"{big_body}"}}"#);
     let (commands, responses, state) = run_scenario(
         FakeConfig {
             uidplus: true,
@@ -1036,9 +1108,7 @@ async fn update_draft_body_over_preliminary_limit_rejected_before_composing() {
 #[tokio::test]
 async fn create_draft_body_over_preliminary_limit_rejected_before_composing() {
     let big_body = "y".repeat(200);
-    let call = format!(
-        r#"{{"to":"dest@example.com","subject":"s","body":"{big_body}"}}"#
-    );
+    let call = format!(r#"{{"to":"dest@example.com","subject":"s","body":"{big_body}"}}"#);
     let (commands, responses, _state) = run_scenario(
         FakeConfig {
             uidplus: true,
@@ -1162,7 +1232,10 @@ async fn update_draft_attachment_without_root_rejected_nondestructively() {
     );
     let st = state.lock().unwrap();
     assert!(st.exists(1), "il vecchio draft resta intatto");
-    assert!(!st.is_deleted(1), "il vecchio draft non deve essere marcato");
+    assert!(
+        !st.is_deleted(1),
+        "il vecchio draft non deve essere marcato"
+    );
 }
 
 /// A blocked literal write (a peer that does not read) must produce the
@@ -1171,9 +1244,7 @@ async fn update_draft_attachment_without_root_rejected_nondestructively() {
 #[tokio::test]
 async fn append_write_blocked_by_peer_yields_uncertain_within_deadline() {
     let big_body = "x".repeat(64 * 1024 * 1024);
-    let call = format!(
-        r#"{{"uid":1,"to":"dest@example.com","subject":"s","body":"{big_body}"}}"#
-    );
+    let call = format!(r#"{{"uid":1,"to":"dest@example.com","subject":"s","body":"{big_body}"}}"#);
     let (commands, responses, state) = run_scenario(
         FakeConfig {
             uidplus: true,
@@ -1312,9 +1383,7 @@ async fn dedicated_connect_silent_login_reports_nothing_transferred() {
 #[tokio::test]
 async fn preflight_wins_over_address_validation() {
     let big_body = "x".repeat(200);
-    let call = format!(
-        r#"{{"uid":1,"to":"non-e-una-email","subject":"s","body":"{big_body}"}}"#
-    );
+    let call = format!(r#"{{"uid":1,"to":"non-e-una-email","subject":"s","body":"{big_body}"}}"#);
     let (commands, responses, _state) = run_scenario(
         FakeConfig {
             uidplus: true,

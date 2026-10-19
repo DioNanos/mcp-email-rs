@@ -100,8 +100,8 @@ async fn send_email_attachment_roundtrip_identical_bytes() {
     let root = home.join("attach-root");
     let content = payload(1000);
     write_file(&root.join("report.bin"), &content);
-    let server = EmailServer::from_config(test_config(Some(root.clone()), 25_000_000, 50))
-        .expect("server");
+    let server =
+        EmailServer::from_config(test_config(Some(root.clone()), 25_000_000, 50)).expect("server");
 
     let message = server
         .compose_send_email(&SendEmailParams {
@@ -168,7 +168,10 @@ async fn create_draft_attachment_roundtrip_identical_bytes() {
     let parsed = mail_parser::MessageParser::default()
         .parse(&raw)
         .expect("MIME riparsabile");
-    assert_eq!(parsed.attachment(0).expect("allegato").contents(), &content[..]);
+    assert_eq!(
+        parsed.attachment(0).expect("allegato").contents(),
+        &content[..]
+    );
     assert_no_sentinel(&raw, "create_draft");
     assert!(!contains(&raw, root.to_string_lossy().as_bytes()));
 }
@@ -198,7 +201,10 @@ async fn update_draft_attachment_roundtrip_identical_bytes() {
     let parsed = mail_parser::MessageParser::default()
         .parse(&raw)
         .expect("MIME riparsabile");
-    assert_eq!(parsed.attachment(0).expect("allegato").contents(), &content[..]);
+    assert_eq!(
+        parsed.attachment(0).expect("allegato").contents(),
+        &content[..]
+    );
     assert_no_sentinel(&raw, "update_draft");
     assert!(!contains(&raw, root.to_string_lossy().as_bytes()));
 }
@@ -315,7 +321,10 @@ async fn final_internal_symlink_is_rejected_defends_o_nofollow() {
         bcc: None,
         attachments: Some(vec![att("link_interno.txt")]),
     });
-    assert!(result.is_err(), "symlink finale deve essere rifiutato (O_NOFOLLOW)");
+    assert!(
+        result.is_err(),
+        "symlink finale deve essere rifiutato (O_NOFOLLOW)"
+    );
     let _ = fs::remove_dir_all(&home);
 }
 
@@ -333,8 +342,8 @@ async fn concurrent_swap_classified_and_no_sentinel_leak() {
     // Declared epistemic limit: with openat2 the identity check and the
     // open are the SAME atomic syscall — there is no observable internal
     // window between "check" and "read" where a barrier could be planted.
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     let (home, root, sentinel) = sentinel_setup();
     let benign = root.join("swap.bin");
@@ -343,9 +352,10 @@ async fn concurrent_swap_classified_and_no_sentinel_leak() {
     let benign = Arc::new(benign);
     let sentinel = Arc::new(sentinel);
 
-    let server_shared =
-        Arc::new(EmailServer::from_config(test_config(Some((*root).clone()), 25_000_000, 50))
-            .expect("server"));
+    let server_shared = Arc::new(
+        EmailServer::from_config(test_config(Some((*root).clone()), 25_000_000, 50))
+            .expect("server"),
+    );
 
     let stop = Arc::new(AtomicBool::new(false));
     let ok_count = Arc::new(AtomicU64::new(0));
@@ -437,7 +447,11 @@ async fn concurrent_swap_classified_and_no_sentinel_leak() {
     stop.store(true, Ordering::SeqCst);
     attacker.join().expect("join attacker");
 
-    assert_eq!(unclassified.load(Ordering::SeqCst), 0, "ogni errore deve essere classificato");
+    assert_eq!(
+        unclassified.load(Ordering::SeqCst),
+        0,
+        "ogni errore deve essere classificato"
+    );
     assert_eq!(
         sentinel_leak.load(Ordering::SeqCst),
         0,
@@ -508,7 +522,9 @@ async fn same_path_reopened_by_name_across_swapped_states() {
         let error = server
             .compose_send_email(&params())
             .err()
-            .unwrap_or_else(|| panic!("iterazione {iteration}: stato symlink deve essere rifiutato"));
+            .unwrap_or_else(|| {
+                panic!("iterazione {iteration}: stato symlink deve essere rifiutato")
+            });
         assert!(
             error.to_string().contains("rifiutata da openat2"),
             "iterazione {iteration}: atteso rifiuto openat2, trovato: {error}"
@@ -571,8 +587,8 @@ async fn multi_attachment_near_limit_not_falsely_rejected() {
     let root = home.join("attach-root");
     write_file(&root.join("uno.bin"), &vec![b'A'; 9_000_000]);
     write_file(&root.join("due.bin"), &vec![b'B'; 9_000_000]);
-    let server_25m = EmailServer::from_config(test_config(Some(root.clone()), 25_000_000, 50))
-        .expect("server");
+    let server_25m =
+        EmailServer::from_config(test_config(Some(root.clone()), 25_000_000, 50)).expect("server");
     let params_two = CreateDraftParams {
         to: "dest@example.test".into(),
         subject: "multi cap".into(),
@@ -636,8 +652,8 @@ async fn mixed_text_and_binary_near_limit_not_falsely_rejected() {
     text.truncate(18_000_000 - (18_000_000 % 3)); // resta ASCII pulito
     write_file(&root.join("testo.txt"), &text);
     write_file(&root.join("binario.bin"), &payload(3_000_000));
-    let server_25m = EmailServer::from_config(test_config(Some(root.clone()), 25_000_000, 50))
-        .expect("server");
+    let server_25m =
+        EmailServer::from_config(test_config(Some(root.clone()), 25_000_000, 50)).expect("server");
     let message = server_25m
         .compose_create_draft(&CreateDraftParams {
             to: "dest@example.test".into(),
@@ -687,12 +703,9 @@ async fn size_cap_exact_limit_passes_one_encoded_byte_over_fails() {
         .len();
 
     // Esattamente al limite: passa.
-    let server_exact = EmailServer::from_config(test_config(
-        Some(root.clone()),
-        exact_len as u64,
-        50,
-    ))
-    .expect("server");
+    let server_exact =
+        EmailServer::from_config(test_config(Some(root.clone()), exact_len as u64, 50))
+            .expect("server");
     assert!(
         server_exact.compose_create_draft(&params()).is_ok(),
         "MIME di {exact_len} byte deve passare con tetto {exact_len}"
@@ -709,8 +722,8 @@ async fn size_cap_exact_limit_passes_one_encoded_byte_over_fails() {
     // proof is the MEASURE of the bytes read reported by the error, not the
     // duration.
     write_file(&root.join("cap.txt"), &vec![b'B'; 5_000_000]);
-    let server_small = EmailServer::from_config(test_config(Some(root.clone()), 1_000, 50))
-        .expect("server");
+    let server_small =
+        EmailServer::from_config(test_config(Some(root.clone()), 1_000, 50)).expect("server");
     let started = std::time::Instant::now();
     let error = server_small
         .compose_create_draft(&params())
@@ -776,7 +789,10 @@ async fn names_and_mime_types_validation() {
         })
         .expect("compose")
         .formatted();
-    assert!(contains(&raw, b"filename=\"report.bin\""), "basename esposto");
+    assert!(
+        contains(&raw, b"filename=\"report.bin\""),
+        "basename esposto"
+    );
     assert!(
         !contains(&raw, b"sub/report.bin"),
         "il percorso non deve comparire nel MIME"
@@ -865,7 +881,10 @@ async fn names_and_mime_types_validation() {
                 mime: None,
             }]),
         });
-        assert!(result.is_err(), "filename '{bad_name}' deve essere rifiutato");
+        assert!(
+            result.is_err(),
+            "filename '{bad_name}' deve essere rifiutato"
+        );
     }
     let _ = fs::remove_dir_all(&home);
 }
@@ -888,7 +907,10 @@ async fn backslash_in_implicit_basename_is_rejected() {
         bcc: None,
         attachments: Some(vec![att("back\\slash.bin")]),
     });
-    assert!(result.is_err(), "basename implicito con backslash: rifiutato");
+    assert!(
+        result.is_err(),
+        "basename implicito con backslash: rifiutato"
+    );
     // Nome esplicito valido sullo stesso file: passa e il nome esposto è quello.
     let raw = server
         .compose_create_draft(&CreateDraftParams {
@@ -963,8 +985,8 @@ async fn attachment_count_limit_enforced() {
     for name in ["a.txt", "b.txt", "c.txt"] {
         write_file(&root.join(name), b"x");
     }
-    let server = EmailServer::from_config(test_config(Some(root.clone()), 25_000_000, 2))
-        .expect("server");
+    let server =
+        EmailServer::from_config(test_config(Some(root.clone()), 25_000_000, 2)).expect("server");
     let result = server.compose_create_draft(&CreateDraftParams {
         to: "d@e.test".into(),
         subject: "count".into(),
@@ -1012,7 +1034,10 @@ async fn omitted_and_empty_attachments_are_identical() {
         })
         .expect("compose")
         .formatted();
-    assert_eq!(omitted, empty, "omesso e [] sono la stessa cosa: niente conservazione implicita");
+    assert_eq!(
+        omitted, empty,
+        "omesso e [] sono la stessa cosa: niente conservazione implicita"
+    );
     assert!(!contains(&empty, b"keep.txt"), "nessun allegato residuo");
     let _ = fs::remove_dir_all(&home);
 }
@@ -1057,7 +1082,10 @@ async fn html_with_attachments_is_mixed_with_alternative_inside() {
         .expect("compose")
         .formatted();
     assert!(contains(&raw, b"multipart/mixed"), "mixed esterno");
-    assert!(contains(&raw, b"multipart/alternative"), "alternative interno");
+    assert!(
+        contains(&raw, b"multipart/alternative"),
+        "alternative interno"
+    );
     let parsed = mail_parser::MessageParser::default()
         .parse(&raw)
         .expect("riparsabile");

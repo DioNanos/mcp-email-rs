@@ -31,6 +31,21 @@ use lettre::message::{Attachment as LettreAttachment, MultiPart, SinglePart};
 
 use crate::error::EmailError;
 
+// On Linux the openat2 RESOLVE_* flags come straight from libc.
+#[cfg(not(target_os = "android"))]
+use libc::{RESOLVE_BENEATH, RESOLVE_NO_SYMLINKS};
+
+// Android: libc 0.2.184 does not export the openat2 RESOLVE_* constants for
+// android targets (they live in libc's linux-only module), so define them
+// locally from the kernel UAPI header include/uapi/linux/openat2.h:
+// RESOLVE_NO_SYMLINKS = 0x04, RESOLVE_BENEATH = 0x08. Same values libc
+// exposes on Linux: identical behavior, only the source of the constants
+// differs. Kernels without openat2 (< 5.6) still fail closed via ENOSYS.
+#[cfg(target_os = "android")]
+const RESOLVE_NO_SYMLINKS: libc::c_int = 0x04;
+#[cfg(target_os = "android")]
+const RESOLVE_BENEATH: libc::c_int = 0x08;
+
 /// Tetto predefinito sul MIME serializzato dell'intero messaggio, in byte.
 pub const DEFAULT_MAX_MIME_BYTES: u64 = 25_000_000;
 
@@ -181,7 +196,7 @@ fn validate_relative(path: &str) -> Result<(), EmailError> {
         match comp {
             std::path::Component::ParentDir => return reject("'..' non è ammesso"),
             std::path::Component::RootDir | std::path::Component::Prefix(_) => {
-                return reject("componente non relativa")
+                return reject("componente non relativa");
             }
             _ => {}
         }
@@ -200,14 +215,18 @@ fn open_regular_beneath(root: &Path, relative: &str) -> Result<File, EmailError>
     open_regular_beneath_with(
         root,
         relative,
-        (libc::RESOLVE_BENEATH | libc::RESOLVE_NO_SYMLINKS) as u64,
+        (RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS) as u64,
     )
 }
 
 /// Variante con flag `resolve` espliciti: serve ai test per il controllo
 /// positivo («senza BENEATH la sentinella è leggibile») senza toccare la
 /// produzione.
-fn open_regular_beneath_with(root: &Path, relative: &str, resolve: u64) -> Result<File, EmailError> {
+fn open_regular_beneath_with(
+    root: &Path,
+    relative: &str,
+    resolve: u64,
+) -> Result<File, EmailError> {
     let dir = File::open(root).map_err(|e| {
         EmailError::Config(format!(
             "EMAIL_ATTACH_DIR '{}' non apribile: {e}",
@@ -257,9 +276,9 @@ fn open_regular_beneath_with(root: &Path, relative: &str, resolve: u64) -> Resul
     }
     // Proprietà del fd passa a File (chiusura automatica anche sui rami di errore).
     let file = unsafe { File::from_raw_fd(fd as std::os::fd::RawFd) };
-    let meta = file.metadata().map_err(|e| {
-        EmailError::Other(format!("fstat su '{relative}' fallito: {e}"))
-    })?;
+    let meta = file
+        .metadata()
+        .map_err(|e| EmailError::Other(format!("fstat su '{relative}' fallito: {e}")))?;
     if !meta.is_file() {
         return Err(EmailError::Other(format!(
             "'{relative}' non è un file regolare: FIFO/socket/device rifiutati senza leggere"
@@ -409,9 +428,11 @@ pub fn compose_body(
         .body(body);
     let core = match html {
         Some(html) => ComposedBody::Multi(
-            MultiPart::alternative()
-                .singlepart(text_part)
-                .singlepart(SinglePart::builder().header(ContentType::TEXT_HTML).body(html)),
+            MultiPart::alternative().singlepart(text_part).singlepart(
+                SinglePart::builder()
+                    .header(ContentType::TEXT_HTML)
+                    .body(html),
+            ),
         ),
         None => ComposedBody::Single(text_part),
     };
@@ -438,11 +459,11 @@ mod tests {
 
     const SENTINEL_UNIT_BYTES: &[u8] = b"SENTINEL-UNIT-ESTERNA";
 
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.windows(needle.len()).any(|w| w == needle)
-}
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
 
-fn tmp_root(tag: &str) -> PathBuf {
+    fn tmp_root(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("attach-unit-{}-{}", std::process::id(), tag));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("mkdir");
@@ -480,15 +501,15 @@ fn tmp_root(tag: &str) -> PathBuf {
         // CONTROLLO POSITIVO 2 (R3): senza RESOLVE_BENEATH (solo NO_SYMLINKS)
         // la STESSA fuga legge la STESSA sentinella — quindi il fallimento del
         // caso negativo è imputabile a BENEATH e non all'assenza del file.
-        let mut positive = open_regular_beneath_with(
-            &root,
-            "../outside/sentinel.txt",
-            libc::RESOLVE_NO_SYMLINKS as u64,
-        )
-        .expect("senza BENEATH la sentinella oltre la radice deve essere leggibile");
+        let mut positive =
+            open_regular_beneath_with(&root, "../outside/sentinel.txt", RESOLVE_NO_SYMLINKS as u64)
+                .expect("senza BENEATH la sentinella oltre la radice deve essere leggibile");
         let mut contents = Vec::new();
         std::io::Read::read_to_end(&mut positive, &mut contents).expect("lettura sentinella");
-        assert_eq!(contents, b"SENTINEL-ATTACH", "contenuto sentinella oltre la radice");
+        assert_eq!(
+            contents, b"SENTINEL-ATTACH",
+            "contenuto sentinella oltre la radice"
+        );
 
         // Caso negativo: con i flag di produzione la fuga è bloccata.
         let result = open_regular_beneath(&root, "../outside/sentinel.txt");
@@ -515,7 +536,10 @@ fn tmp_root(tag: &str) -> PathBuf {
 
         let max_raw: u64 = 64 * 1024;
         let mut pulled: u64 = 0;
-        struct Meter<'a, R: Read> { inner: R, pulled: &'a mut u64 }
+        struct Meter<'a, R: Read> {
+            inner: R,
+            pulled: &'a mut u64,
+        }
         impl<'a, R: Read> Read for Meter<'a, R> {
             fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
                 let n = self.inner.read(buf)?;
@@ -524,11 +548,17 @@ fn tmp_root(tag: &str) -> PathBuf {
             }
         }
         let result = read_bounded(
-            Meter { inner: file, pulled: &mut pulled },
+            Meter {
+                inner: file,
+                pulled: &mut pulled,
+            },
             max_raw,
             "big.bin",
         );
-        assert!(result.is_err(), "budget minuscolo su file da 5MB: atteso errore");
+        assert!(
+            result.is_err(),
+            "budget minuscolo su file da 5MB: atteso errore"
+        );
         assert!(
             pulled <= max_raw + 65_536 + 1,
             "metro indipendente: lettura fermata vicino al budget, tirati {pulled} byte"
@@ -562,16 +592,29 @@ fn tmp_root(tag: &str) -> PathBuf {
 
         let swap_root = root.clone();
         let swap_sentinel = outside.clone();
-        AFTER_OPEN_HOOK.lock().expect("lock").replace(Box::new(move || {
-            let _ = fs::remove_file(swap_root.join("target.bin"));
-            symlink(swap_sentinel.join("sentinel.txt"), swap_root.join("target.bin"))
+        AFTER_OPEN_HOOK
+            .lock()
+            .expect("lock")
+            .replace(Box::new(move || {
+                let _ = fs::remove_file(swap_root.join("target.bin"));
+                symlink(
+                    swap_sentinel.join("sentinel.txt"),
+                    swap_root.join("target.bin"),
+                )
                 .expect("symlink post-open");
-        }));
+            }));
 
         let prepared = prepare(
             &root,
-            [AttachmentInput { path: "target.bin", filename: None, mime: None }],
-            AttachmentLimits { max_mime_bytes: 25_000_000, max_count: 50 },
+            [AttachmentInput {
+                path: "target.bin",
+                filename: None,
+                mime: None,
+            }],
+            AttachmentLimits {
+                max_mime_bytes: 25_000_000,
+                max_count: 50,
+            },
         )
         .expect("implementazione corretta: legge dal fd GIÀ APERTO, immune allo scambio post-open");
 

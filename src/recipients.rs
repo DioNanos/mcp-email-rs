@@ -358,7 +358,10 @@ mod tests {
         assert_eq!(split_top_level("\"Doe; John\" <a@example.test>").len(), 1);
         assert_eq!(split_top_level("\"Doe, John\" <a@example.test>").len(), 1);
         // And inside comments, even nested.
-        assert_eq!(split_top_level("a@example.test (a;b), b@example.test").len(), 2);
+        assert_eq!(
+            split_top_level("a@example.test (a;b), b@example.test").len(),
+            2
+        );
     }
 
     // ── Rejections: groups, empties, separators, control chars ───────
@@ -499,7 +502,9 @@ mod tests {
             ("cc", "niente@"),
             ("bcc", "x"),
         ] {
-            let err = parse_mailbox_list(field, raw).map_err(|e| format!("{e:?}")).unwrap_err();
+            let err = parse_mailbox_list(field, raw)
+                .map_err(|e| format!("{e:?}"))
+                .unwrap_err();
             assert!(
                 !err.contains("example.test") && !err.contains("niente") && !err.contains("x@"),
                 "error must not echo raw input: {err}"
@@ -546,7 +551,10 @@ mod tests {
         assert_eq!(entry_count(""), 0);
         assert_eq!(entry_count("   "), 0);
         assert_eq!(entry_count("a@example.test"), 1);
-        assert_eq!(entry_count("a@example.test,b@example.test;c@example.test"), 3);
+        assert_eq!(
+            entry_count("a@example.test,b@example.test;c@example.test"),
+            3
+        );
         // Separators inside quotes are NOT separators.
         assert_eq!(entry_count("\"a,b;c\"@example.test"), 1);
     }

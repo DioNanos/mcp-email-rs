@@ -393,7 +393,9 @@ impl EmailConfig {
             .ok()
             .map(|v| v.parse::<usize>())
             .transpose()
-            .map_err(|_| EmailError::Config("EMAIL_ATTACH_MAX_COUNT non è un numero valido".into()))?
+            .map_err(|_| {
+                EmailError::Config("EMAIL_ATTACH_MAX_COUNT non è un numero valido".into())
+            })?
             .unwrap_or(DEFAULT_MAX_COUNT);
 
         Ok(Self {

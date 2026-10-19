@@ -280,8 +280,7 @@ async fn append_new_draft(
     // read: a server sending untagged traffic forever cannot keep the
     // connection open indefinitely.
     let deadline = tokio::time::Instant::now() + operation_timeout;
-    let remaining =
-        || deadline.saturating_duration_since(tokio::time::Instant::now());
+    let remaining = || deadline.saturating_duration_since(tokio::time::Instant::now());
 
     // Quoting RFC 3501 della mailbox (l'helper `validate_str` della crate
     // non e' pubblico): backslash e doppi apici escaped dentro "...".
@@ -1641,7 +1640,9 @@ impl EmailServer {
 
     // ── Send and drafts ─────────────────────────────────────────
 
-    #[tool(description = "Send an email via SMTP. `to`, `cc` and `bcc` accept a single address or a comma/semicolon separated list; Bcc recipients go in the SMTP envelope only and are never written in the message headers (RFC 5322 §3.6.3)")]
+    #[tool(
+        description = "Send an email via SMTP. `to`, `cc` and `bcc` accept a single address or a comma/semicolon separated list; Bcc recipients go in the SMTP envelope only and are never written in the message headers (RFC 5322 §3.6.3)"
+    )]
     async fn send_email(
         &self,
         params: Parameters<SendEmailParams>,
@@ -1801,7 +1802,9 @@ impl EmailServer {
         ]))
     }
 
-    #[tool(description = "Create a new draft email. `to`, `cc` and `bcc` accept a single address or a comma/semicolon separated list; Cc and Bcc headers are stored in the private IMAP draft (Bcc included, so the draft stays editable; it is stripped when sending)")]
+    #[tool(
+        description = "Create a new draft email. `to`, `cc` and `bcc` accept a single address or a comma/semicolon separated list; Cc and Bcc headers are stored in the private IMAP draft (Bcc included, so the draft stays editable; it is stripped when sending)"
+    )]
     async fn create_draft(
         &self,
         params: Parameters<CreateDraftParams>,
@@ -1826,7 +1829,9 @@ impl EmailServer {
         )]))
     }
 
-    #[tool(description = "Update an existing draft: the new version is APPENDed first and only after confirmed success the old draft is removed with a targeted UID EXPUNGE; without UIDPLUS the old draft is preserved (partial substitution, never a global EXPUNGE). Returns the new UID when the server provides APPENDUID. `to`, `cc` and `bcc` accept a single address or a comma/semicolon separated list and are FULL REPLACEMENT: omitting `cc`/`bcc` removes those headers from the new draft (Cc and Bcc are stored in the private draft, Bcc included; it is stripped when sending)")]
+    #[tool(
+        description = "Update an existing draft: the new version is APPENDed first and only after confirmed success the old draft is removed with a targeted UID EXPUNGE; without UIDPLUS the old draft is preserved (partial substitution, never a global EXPUNGE). Returns the new UID when the server provides APPENDUID. `to`, `cc` and `bcc` accept a single address or a comma/semicolon separated list and are FULL REPLACEMENT: omitting `cc`/`bcc` removes those headers from the new draft (Cc and Bcc are stored in the private draft, Bcc included; it is stripped when sending)"
+    )]
     async fn update_draft(
         &self,
         params: Parameters<UpdateDraftParams>,
@@ -2104,16 +2109,15 @@ impl EmailServer {
         // default `drop_bcc` then removes the Bcc header from the
         // serialized message (RFC 5322 §3.6.3) — verified by the fake
         // SMTP test: RCPT TO carries to+cc+bcc, DATA has no Bcc header.
-        let mut builder = crate::recipients::apply_recipients(
-            lettre::Message::builder()
-                .from(
-                    from_addr
-                        .parse()
-                        .map_err(|e| McpError::internal_error(format!("Invalid from: {e}"), None))?,
-                )
-                .subject(&params.subject),
-            recipients,
-        );
+        let mut builder =
+            crate::recipients::apply_recipients(
+                lettre::Message::builder()
+                    .from(from_addr.parse().map_err(|e| {
+                        McpError::internal_error(format!("Invalid from: {e}"), None)
+                    })?)
+                    .subject(&params.subject),
+                recipients,
+            );
         if let Some(ref reply_to) = params.reply_to {
             builder =
                 builder.reply_to(reply_to.parse().map_err(|e| {
@@ -2167,17 +2171,16 @@ impl EmailServer {
         // stored headers (`keep_bcc`: lettre's default would drop it at
         // build time) — the draft stays fully editable. Bcc is stripped
         // from the message only when SENDING (see compose_send_email).
-        let builder = crate::recipients::apply_recipients(
-            lettre::Message::builder()
-                .from(
-                    from_addr
-                        .parse()
-                        .map_err(|e| McpError::internal_error(format!("Invalid from: {e}"), None))?,
-                )
-                .keep_bcc()
-                .subject(&params.subject),
-            recipients,
-        );
+        let builder =
+            crate::recipients::apply_recipients(
+                lettre::Message::builder()
+                    .from(from_addr.parse().map_err(|e| {
+                        McpError::internal_error(format!("Invalid from: {e}"), None)
+                    })?)
+                    .keep_bcc()
+                    .subject(&params.subject),
+                recipients,
+            );
         let prepared = self.prepare_attachments(params.attachments.as_deref())?;
         let composed = crate::attachments::compose_body(
             params.body.clone().unwrap_or_default(),
@@ -2219,17 +2222,16 @@ impl EmailServer {
             params.bcc.as_deref(),
         )?;
         // come compose_create_draft: bozza privata, Bcc conservato.
-        let builder = crate::recipients::apply_recipients(
-            lettre::Message::builder()
-                .from(
-                    from_addr
-                        .parse()
-                        .map_err(|e| McpError::internal_error(format!("Invalid from: {e}"), None))?,
-                )
-                .keep_bcc()
-                .subject(&params.subject),
-            recipients,
-        );
+        let builder =
+            crate::recipients::apply_recipients(
+                lettre::Message::builder()
+                    .from(from_addr.parse().map_err(|e| {
+                        McpError::internal_error(format!("Invalid from: {e}"), None)
+                    })?)
+                    .keep_bcc()
+                    .subject(&params.subject),
+                recipients,
+            );
         let prepared = self.prepare_attachments(params.attachments.as_deref())?;
         let composed = crate::attachments::compose_body(
             params.body.clone().unwrap_or_default(),
@@ -2334,12 +2336,12 @@ impl EmailServer {
                 "Email uid={} deleted (targeted UID EXPUNGE; other \\Deleted messages untouched)",
                 params.uid
             ))])),
-            ExpungeOutcome::DeferredMarkedOnly => Ok(CallToolResult::success(vec![Content::text(
-                format!(
+            ExpungeOutcome::DeferredMarkedOnly => {
+                Ok(CallToolResult::success(vec![Content::text(format!(
                     "Email uid={} marked \\Deleted but NOT expunged: the server does not advertise UIDPLUS, so a targeted removal is unavailable and a global EXPUNGE is never used (it would also remove \\Deleted messages from other clients). The mark remains; the message will disappear when the folder is next expunged.",
                     params.uid
-                ),
-            )])),
+                ))]))
+            }
         }
     }
 
@@ -2540,11 +2542,11 @@ impl EmailServer {
                 "Deleted {} emails (targeted UID EXPUNGE of uid set {uid_set}; other \\Deleted messages untouched)",
                 params.uids.len()
             ))])),
-            ExpungeOutcome::DeferredMarkedOnly => Ok(CallToolResult::success(vec![Content::text(
-                format!(
+            ExpungeOutcome::DeferredMarkedOnly => {
+                Ok(CallToolResult::success(vec![Content::text(format!(
                     "Deleted 0 emails: {uid_set} marked \\Deleted but NOT expunged — the server does not advertise UIDPLUS, so a targeted removal is unavailable and a global EXPUNGE is never used (it would also remove \\Deleted messages from other clients). The marks remain; the messages will disappear when the folder is next expunged.",
-                ),
-            )])),
+                ))]))
+            }
         }
     }
 
@@ -3028,9 +3030,7 @@ impl EmailServer {
     /// NEVER returned to it — on drop it is simply closed. Used for the
     /// draft APPEND, which can leave the session waiting for a literal (a
     /// non-reusable protocol state).
-    async fn dedicated_imap_session(
-        &self,
-    ) -> Result<crate::pool::TlsImapSession, McpError> {
+    async fn dedicated_imap_session(&self) -> Result<crate::pool::TlsImapSession, McpError> {
         let auth = match self.config.imap_auth {
             crate::config::AuthMechanism::Plain | crate::config::AuthMechanism::Auto => {
                 crate::pool::AuthMethod::Plain {
@@ -3041,9 +3041,10 @@ impl EmailServer {
                 password: self.config.imap_password.clone(),
             },
             crate::config::AuthMechanism::XOAuth2 => {
-                let token = self.config.imap_xoauth2_token.clone().ok_or_else(|| {
-                    McpError::internal_error("IMAP_XOAUTH2_TOKEN required", None)
-                })?;
+                let token =
+                    self.config.imap_xoauth2_token.clone().ok_or_else(|| {
+                        McpError::internal_error("IMAP_XOAUTH2_TOKEN required", None)
+                    })?;
                 crate::pool::AuthMethod::XOAuth2 {
                     user: self.config.imap_user.clone(),
                     access_token: token,
