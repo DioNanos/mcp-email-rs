@@ -51,7 +51,7 @@ platform, verifies its checksum, and installs atomically to `~/.local/bin`:
 curl -fsSLO https://raw.githubusercontent.com/DioNanos/mcp-email-rs/main/install.sh
 less install.sh   # always read scripts before running them
 bash install.sh            # latest release
-bash install.sh --version v0.3.5   # or pin a version
+bash install.sh --version v0.3.6   # or pin a version
 ```
 
 
